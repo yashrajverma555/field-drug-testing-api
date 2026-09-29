@@ -615,7 +615,7 @@ async def analyze_test(
 EOF
 python3 -m py_compile /tmp/test_main_direct.py
 `
-Ran command: `python3 -c "
+
 import cv2, numpy as np
 
 def rgb_to_lab(r, g, b):
@@ -1246,4 +1246,4 @@ async def analyze_test(
                 "error": f"An error occurred while processing the test image: {str(e)}"
             }
         )
-```
+
