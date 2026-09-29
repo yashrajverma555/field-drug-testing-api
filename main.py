@@ -1,4 +1,4 @@
-```python
+
 import base64
 import datetime
 import hashlib
@@ -613,4 +613,4 @@ async def analyze_test(
                 "error": f"An error occurred while processing the test image: {str(e)}"
             }
         )
-```
+
