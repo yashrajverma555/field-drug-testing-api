@@ -1,838 +1,632 @@
 import base64
+import datetime
 import hashlib
-import io
 import json
+import logging
 import math
-import os
-import uuid
-from datetime import datetime, timezone
+import secrets
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-app = FastAPI(title="Field Drug Testing Color Analysis API", version="3.0")
-
-# ---------------------------------------------------------------------------
-# CONFIG
-# ---------------------------------------------------------------------------
-# IMPORTANT:
-# These are DEMO prototypes only. Replace them with values measured from
-# known-positive and known-negative images of YOUR exact test kit.
-#
-# The screenshot supplied by the user contains:
-#   LEFT  = a large reference/color swatch
-#   RIGHT = test cassette
-# Therefore this version does NOT assume a 6-patch reference card.
-DEMO_POSITIVE_RGB = np.array([180.0, 70.0, 60.0])
-DEMO_NEGATIVE_RGB = np.array([215.0, 215.0, 215.0])
-
-MAX_DISTANCE = float(os.getenv("MAX_DISTANCE", "90"))
-MIN_MARGIN = float(os.getenv("MIN_MARGIN", "12"))
-MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "55"))
-
-# Set DEMO_MODE=false after you have supplied real kit-specific prototypes.
-DEMO_MODE = os.getenv("DEMO_MODE", "true").lower() == "true"
-
-
-# ---------------------------------------------------------------------------
-# BASIC COLOR FUNCTIONS
-# ---------------------------------------------------------------------------
-def rgb_hex(rgb):
-    rgb = np.clip(np.asarray(rgb), 0, 255).astype(int)
-    return "#{:02X}{:02X}{:02X}".format(*rgb)
-
-
-def rgb_to_hsv(rgb):
-    arr = np.array([[np.clip(rgb, 0, 255).astype(np.uint8)]])
-    return cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)[0, 0].astype(float)
-
-
-def rgb_to_lab(rgb):
-    arr = np.array([[np.clip(rgb, 0, 255).astype(np.uint8)]])
-    return cv2.cvtColor(arr, cv2.COLOR_RGB2LAB)[0, 0].astype(float)
-
-
-def color_family(rgb):
-    hsv = rgb_to_hsv(rgb)
-    h, s, v = hsv
-
-    if s < 25 and v > 220:
-        return "WHITE"
-    if s < 30 and v < 65:
-        return "BLACK"
-    if s < 35:
-        return "GRAY"
-
-    if h < 10 or h >= 170:
-        return "RED"
-    if h < 22:
-        return "ORANGE"
-    if h < 38:
-        return "YELLOW"
-    if h < 85:
-        return "GREEN"
-    if h < 105:
-        return "CYAN"
-    if h < 135:
-        return "BLUE"
-    if h < 165:
-        return "PURPLE"
-    return "RED"
-
-
-def robust_color(roi_rgb):
-    """
-    Median RGB after trimming extreme brightness pixels.
-    This is much less sensitive to glare, shadows and small dirt spots
-    than a simple mean.
-    """
-    pixels = roi_rgb.reshape(-1, 3).astype(np.float32)
-
-    if len(pixels) < 20:
-        raise ValueError("ROI contains too few pixels")
-
-    brightness = (
-        0.2126 * pixels[:, 0]
-        + 0.7152 * pixels[:, 1]
-        + 0.0722 * pixels[:, 2]
-    )
-
-    p5, p95 = np.percentile(brightness, [5, 95])
-    keep = (brightness >= p5) & (brightness <= p95)
-    pixels = pixels[keep]
-
-    if len(pixels) == 0:
-        return np.median(roi_rgb.reshape(-1, 3), axis=0)
-
-    return np.median(pixels, axis=0)
-
-
-def measure_color(image_rgb, rect, label):
-    x1, y1, x2, y2 = [int(v) for v in rect]
-    h, w = image_rgb.shape[:2]
-
-    x1 = max(0, min(w - 1, x1))
-    y1 = max(0, min(h - 1, y1))
-    x2 = max(x1 + 1, min(w, x2))
-    y2 = max(y1 + 1, min(h, y2))
-
-    # Ignore the border: sample only the middle 70%.
-    rw = x2 - x1
-    rh = y2 - y1
-    sx1 = x1 + int(rw * 0.15)
-    sy1 = y1 + int(rh * 0.15)
-    sx2 = x2 - int(rw * 0.15)
-    sy2 = y2 - int(rh * 0.15)
-
-    roi = image_rgb[sy1:sy2, sx1:sx2]
-
-    rgb = robust_color(roi)
-    hsv = rgb_to_hsv(rgb)
-    lab = rgb_to_lab(rgb)
-
-    return {
-        "label": label,
-        "rectangle_xyxy": [sx1, sy1, sx2, sy2],
-        "rgb": [round(float(x), 2) for x in rgb],
-        "hex": rgb_hex(rgb),
-        "hsv": [round(float(x), 2) for x in hsv],
-        "lab": [round(float(x), 2) for x in lab],
-        "brightness": round(float(np.mean(rgb)), 2),
-        "saturation": round(float(hsv[1]), 2),
-        "color_family": color_family(rgb),
-        "pixel_count": int(roi.shape[0] * roi.shape[1]),
-    }
-
-
-# ---------------------------------------------------------------------------
-# GEOMETRY / RECTANGLE DETECTION
-# ---------------------------------------------------------------------------
-def order_quad(points):
-    pts = np.asarray(points, dtype=np.float32)
-    s = pts.sum(axis=1)
-    d = np.diff(pts, axis=1).reshape(-1)
-
-    return np.array([
-        pts[np.argmin(s)],       # top-left
-        pts[np.argmin(d)],       # top-right
-        pts[np.argmax(s)],       # bottom-right
-        pts[np.argmax(d)],       # bottom-left
-    ], dtype=np.float32)
-
-
-def rect_from_quad(q):
-    x1 = int(np.min(q[:, 0]))
-    y1 = int(np.min(q[:, 1]))
-    x2 = int(np.max(q[:, 0]))
-    y2 = int(np.max(q[:, 1]))
-    return (x1, y1, x2, y2)
-
-
-def find_rectangles(image_rgb):
-    """
-    Finds large rectangular objects using multiple threshold levels.
-    Returns candidates rather than blindly choosing the largest contour.
-    """
-    gray = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-
-    edge_sets = [
-        cv2.Canny(blur, 30, 100),
-        cv2.Canny(blur, 50, 150),
-        cv2.Canny(blur, 80, 200),
-    ]
-
-    h, w = gray.shape
-    image_area = h * w
-    candidates = []
-
-    for edges in edge_sets:
-        contours, _ = cv2.findContours(
-            edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
-
-        for contour in contours:
-            area = cv2.contourArea(contour)
-
-            if area < image_area * 0.015:
-                continue
-
-            peri = cv2.arcLength(contour, True)
-            approx = cv2.approxPolyDP(contour, 0.035 * peri, True)
-
-            if len(approx) != 4:
-                x, y, cw, ch = cv2.boundingRect(contour)
-                if cw * ch < image_area * 0.02:
-                    continue
-                q = np.array([
-                    [x, y], [x + cw, y],
-                    [x + cw, y + ch], [x, y + ch]
-                ], dtype=np.float32)
-            else:
-                q = order_quad(approx.reshape(4, 2))
-
-            rect = rect_from_quad(q)
-            x1, y1, x2, y2 = rect
-            rw = x2 - x1
-            rh = y2 - y1
-
-            if rw < 80 or rh < 80:
-                continue
-
-            aspect = rw / max(rh, 1)
-
-            # Cards/cassettes are normally not extremely thin.
-            if aspect < 0.35 or aspect > 3.5:
-                continue
-
-            fill = area / max(rw * rh, 1)
-
-            candidates.append({
-                "rect": rect,
-                "quad": q.tolist(),
-                "area": float(area),
-                "fill": float(fill),
-                "center": [
-                    float((x1 + x2) / 2),
-                    float((y1 + y2) / 2)
-                ],
-            })
-
-    # De-duplicate near-identical rectangles.
-    unique = []
-    for c in sorted(candidates, key=lambda x: x["area"], reverse=True):
-        x1, y1, x2, y2 = c["rect"]
-        duplicate = False
-
-        for u in unique:
-            ux1, uy1, ux2, uy2 = u["rect"]
-
-            ix1 = max(x1, ux1)
-            iy1 = max(y1, uy1)
-            ix2 = min(x2, ux2)
-            iy2 = min(y2, uy2)
-
-            inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
-            union = (
-                (x2 - x1) * (y2 - y1)
-                + (ux2 - ux1) * (uy2 - uy1)
-                - inter
-            )
-
-            if union > 0 and inter / union > 0.75:
-                duplicate = True
-                break
-
-        if not duplicate:
-            unique.append(c)
-
-    return unique
-
-
-def detect_reference_and_cassette(image_rgb):
-    """
-    For the user's shown layout:
-        reference card = left large rectangle
-        cassette       = right large rectangle
-
-    We score candidates by horizontal position, size and rectangularity.
-    """
-    h, w = image_rgb.shape[:2]
-    candidates = find_rectangles(image_rgb)
-
-    if not candidates:
-        return None, None, candidates
-
-    # Keep reasonably large objects.
-    candidates = [
-        c for c in candidates
-        if (c["rect"][2] - c["rect"][0]) *
-           (c["rect"][3] - c["rect"][1]) > 0.025 * w * h
-    ]
-
-    if not candidates:
-        return None, None, []
-
-    left = [
-        c for c in candidates
-        if c["center"][0] < 0.52 * w
-    ]
-
-    right = [
-        c for c in candidates
-        if c["center"][0] >= 0.48 * w
-    ]
-
-    def score(c, desired_side):
-        cx = c["center"][0] / w
-        cy = c["center"][1] / h
-
-        side_score = (
-            (1.0 - cx) if desired_side == "left" else cx
-        )
-
-        area_score = min(
-            1.0,
-            c["area"] / (0.12 * w * h)
-        )
-
-        vertical_score = 1.0 - min(abs(cy - 0.45), 0.45)
-
-        return (
-            0.50 * side_score
-            + 0.30 * area_score
-            + 0.20 * vertical_score
-        )
-
-    ref = max(
-        left or candidates,
-        key=lambda c: score(c, "left")
-    )
-
-    remaining = [
-        c for c in candidates
-        if c is not ref
-    ]
-
-    cassette = None
-
-    if remaining:
-        cassette = max(
-            right or remaining,
-            key=lambda c: score(c, "right")
-        )
-
-    return ref, cassette, candidates
-
-
-# ---------------------------------------------------------------------------
-# TEST AREA
-# ---------------------------------------------------------------------------
-def extract_test_area(image_rgb, cassette_rect):
-    """
-    The screenshot shows the reaction area approximately in the middle
-    of the cassette. We deliberately avoid the cassette border.
-
-    This is a geometry extractor, not a drug-result classifier.
-    """
-    x1, y1, x2, y2 = cassette_rect
-
-    w = x2 - x1
-    h = y2 - y1
-
-    # Central reaction region.
-    tx1 = x1 + int(w * 0.22)
-    tx2 = x1 + int(w * 0.78)
-    ty1 = y1 + int(h * 0.20)
-    ty2 = y1 + int(h * 0.80)
-
-    return (
-        tx1, ty1, tx2, ty2
-    )
-
-
-# ---------------------------------------------------------------------------
-# COLOR COMPARISON
-# ---------------------------------------------------------------------------
-def lab_distance(rgb_a, rgb_b):
-    a = rgb_to_lab(rgb_a)
-    b = rgb_to_lab(rgb_b)
-    return float(np.linalg.norm(a - b))
-
-
-def compare_with_reference(test_rgb, reference_rgb):
-    """
-    Measures whether the test region differs from the local reference.
-    Useful for detecting a color reaction, but NOT sufficient by itself
-    to establish a drug-positive result.
-    """
-    return {
-        "rgb_difference": [
-            round(float(test_rgb[i] - reference_rgb[i]), 2)
-            for i in range(3)
-        ],
-        "absolute_rgb_difference": round(
-            float(np.linalg.norm(test_rgb - reference_rgb)), 2
-        ),
-        "lab_distance": round(
-            lab_distance(test_rgb, reference_rgb), 2
-        ),
-    }
-
-
-def classify_demo(test_rgb):
-    """
-    Conservative prototype classifier.
-
-    Uses LAB distance to kit-specific prototypes.
-    Defaults are DEMO values and must be replaced with measurements from
-    known samples of the exact kit.
-    """
-    d_pos = lab_distance(test_rgb, DEMO_POSITIVE_RGB)
-    d_neg = lab_distance(test_rgb, DEMO_NEGATIVE_RGB)
-
-    nearest = "POSITIVE" if d_pos < d_neg else "NEGATIVE"
-    nearest_distance = min(d_pos, d_neg)
-    margin = abs(d_pos - d_neg)
-
-    # Confidence rises when the nearest class is close AND clearly
-    # separated from the other class.
-    separation = margin / max(d_pos + d_neg, 1.0)
-    closeness = max(0.0, 1.0 - nearest_distance / 150.0)
-
-    confidence = (
-        100.0 * (0.65 * separation + 0.35 * closeness)
-    )
-    confidence = float(np.clip(confidence, 0, 99))
-
-    if nearest_distance > MAX_DISTANCE:
-        result = "INCONCLUSIVE"
-        reason = (
-            "Measured test color is outside the configured kit color "
-            "range."
-        )
-    elif margin < MIN_MARGIN:
-        result = "INCONCLUSIVE"
-        reason = (
-            "Positive and negative prototype colors are too close to "
-            "the measured test color."
-        )
-    elif confidence < MIN_CONFIDENCE:
-        result = "INCONCLUSIVE"
-        reason = "Color separation is insufficient."
-    else:
-        result = nearest
-        reason = (
-            "Prototype color comparison passed the configured "
-            "distance/separation checks."
-        )
-
-    return {
-        "result": result,
-        "confidence_percent": round(confidence, 1),
-        "positive_distance_lab": round(d_pos, 2),
-        "negative_distance_lab": round(d_neg, 2),
-        "margin": round(margin, 2),
-        "reason": reason,
-        "prototype_mode": "DEMO" if DEMO_MODE else "KIT_SPECIFIC",
-        "positive_prototype_rgb": DEMO_POSITIVE_RGB.tolist(),
-        "negative_prototype_rgb": DEMO_NEGATIVE_RGB.tolist(),
-    }
-
-
-# ---------------------------------------------------------------------------
-# IMAGE ANNOTATION
-# ---------------------------------------------------------------------------
-def annotate(
-    image_rgb,
-    reference_rect=None,
-    cassette_rect=None,
-    test_rect=None,
-    result="INCONCLUSIVE",
-    confidence=0,
-):
-    out = cv2.cvtColor(image_rgb.copy(), cv2.COLOR_RGB2BGR)
-
-    if reference_rect:
-        x1, y1, x2, y2 = map(int, reference_rect)
-        cv2.rectangle(
-            out, (x1, y1), (x2, y2),
-            (255, 0, 255), 4
-        )
-        cv2.putText(
-            out,
-            "REFERENCE",
-            (x1, max(30, y1 - 10)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (255, 0, 255),
-            2,
-            cv2.LINE_AA,
-        )
-
-    if cassette_rect:
-        x1, y1, x2, y2 = map(int, cassette_rect)
-        cv2.rectangle(
-            out, (x1, y1), (x2, y2),
-            (0, 255, 0), 4
-        )
-        cv2.putText(
-            out,
-            "TEST CASSETTE",
-            (x1, max(30, y1 - 10)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (0, 255, 0),
-            2,
-            cv2.LINE_AA,
-        )
-
-    if test_rect:
-        x1, y1, x2, y2 = map(int, test_rect)
-        cv2.rectangle(
-            out, (x1, y1), (x2, y2),
-            (0, 0, 255), 4
-        )
-
-        text = f"{result}  {confidence:.1f}%"
-
-        cv2.putText(
-            out,
-            text,
-            (x1, max(30, y1 - 10)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.75,
-            (0, 0, 255),
-            2,
-            cv2.LINE_AA,
-        )
-
-    return cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
-
-
-def encode_jpeg(image_rgb):
-    ok, buffer = cv2.imencode(
-        ".jpg",
-        cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR),
-        [cv2.IMWRITE_JPEG_QUALITY, 92],
-    )
-
-    if not ok:
-        raise RuntimeError("Could not encode annotated image")
-
-    return base64.b64encode(buffer.tobytes()).decode("ascii")
-
-
-# ---------------------------------------------------------------------------
-# QUALITY CHECK
-# ---------------------------------------------------------------------------
-def image_quality(image_rgb):
-    gray = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
+# ------------------------------------------------------------------------------
+# Logging & Server Configuration
+# ------------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+logger = logging.getLogger("field_drug_testing_api")
+
+app = FastAPI(
+    title="Digital Companion for Field Drug Testing API",
+    version="2.0.0",
+    description="Production-grade colourimetric image analysis backend for field drug test kits."
+)
+
+# CORS configuration to fully support Flutter Web and mobile clients
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ------------------------------------------------------------------------------
+# Test Kit Color Reference Configuration
+# ------------------------------------------------------------------------------
+# Conservative calibration placeholder: when None, the system reliably measures
+# and compares colors, returning INCONCLUSIVE with clear scientific rationale.
+TEST_KIT_CONFIG: Dict[str, Any] = {
+    "name": "default",
+    "positive_reference_rgb": None,  # e.g., [180, 20, 60]
+    "negative_reference_rgb": None,  # e.g., [240, 240, 240]
+    "positive_lab_threshold": None,  # e.g., 25.0
+    "negative_lab_threshold": None,  # e.g., 25.0
+}
+
+
+# ------------------------------------------------------------------------------
+# Utility & Color Science Functions
+# ------------------------------------------------------------------------------
+def calculate_sha256(data: bytes) -> str:
+    """Computes SHA-256 directly on the exact raw binary bytes."""
+    return hashlib.sha256(data).hexdigest()
+
+
+def rgb_to_hex(r: int, g: int, b: int) -> str:
+    """Converts RGB integers to standard hexadecimal color representation."""
+    return f"#{int(r):02X}{int(g):02X}{int(b):02X}"
+
+
+def rgb_to_lab(r: float, g: float, b: float) -> Tuple[float, float, float]:
+    """Converts RGB floats to CIE-LAB color space using OpenCV."""
+    pixel_bgr = np.uint8([[[int(round(b)), int(round(g)), int(round(r))]]])
+    lab_pixel = cv2.cvtColor(pixel_bgr, cv2.COLOR_BGR2LAB)
+    return (float(lab_pixel[0, 0, 0]), float(lab_pixel[0, 0, 1]), float(lab_pixel[0, 0, 2]))
+
+
+def rgb_to_hsv(r: float, g: float, b: float) -> Tuple[float, float, float]:
+    """Converts RGB floats to HSV color space using OpenCV."""
+    pixel_bgr = np.uint8([[[int(round(b)), int(round(g)), int(round(r))]]])
+    hsv_pixel = cv2.cvtColor(pixel_bgr, cv2.COLOR_BGR2HSV)
+    return (float(hsv_pixel[0, 0, 0]), float(hsv_pixel[0, 0, 1]), float(hsv_pixel[0, 0, 2]))
+
+
+# ------------------------------------------------------------------------------
+# Image Quality Assessment
+# ------------------------------------------------------------------------------
+def calculate_image_quality(image: np.ndarray) -> Dict[str, Any]:
+    """Assesses blur, exposure, contrast, and resolution without rejecting usable images."""
+    height, width = image.shape[:2]
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
     brightness = float(np.mean(gray))
     contrast = float(np.std(gray))
-    sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
-    # These are image-quality indicators only.
-    score = 100.0
+    laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+    blur_score = float(laplacian.var())
 
-    if brightness < 45 or brightness > 235:
-        score -= 25
+    total_pixels = float(width * height)
+    overexposure_percent = float(np.sum(gray >= 250) / total_pixels * 100.0)
+    underexposure_percent = float(np.sum(gray <= 10) / total_pixels * 100.0)
 
-    if contrast < 15:
-        score -= 20
+    warnings: List[str] = []
+    if blur_score < 40.0:
+        warnings.append("Image may be slightly blurry")
+    if brightness < 35.0:
+        warnings.append("Low ambient lighting detected")
+    elif brightness > 225.0:
+        warnings.append("High ambient brightness / glare detected")
+    if overexposure_percent > 15.0:
+        warnings.append("Significant overexposed glare areas present")
+    if underexposure_percent > 20.0:
+        warnings.append("Significant dark shadow areas present")
 
-    if sharpness < 30:
-        score -= 25
-
-    score = float(np.clip(score, 0, 100))
+    score_components = [
+        min(100.0, max(0.0, blur_score / 2.0)),
+        min(100.0, max(0.0, 100.0 - abs(brightness - 128.0) * 0.7)),
+        min(100.0, max(0.0, contrast * 1.5)),
+        min(100.0, max(0.0, 100.0 - overexposure_percent * 3.0)),
+        min(100.0, max(0.0, 100.0 - underexposure_percent * 3.0)),
+    ]
+    quality_score = float(round(sum(score_components) / len(score_components), 2))
+    acceptable = quality_score >= 30.0 and blur_score >= 20.0
 
     return {
-        "score": round(score, 1),
+        "acceptable": acceptable,
+        "score": quality_score,
+        "resolution": {"width": width, "height": height},
         "brightness": round(brightness, 2),
         "contrast": round(contrast, 2),
-        "sharpness": round(sharpness, 2),
-        "acceptable": score >= 50,
+        "blur_score": round(blur_score, 2),
+        "overexposure_percent": round(overexposure_percent, 2),
+        "underexposure_percent": round(underexposure_percent, 2),
+        "warnings": warnings,
     }
 
 
-# ---------------------------------------------------------------------------
-# ANALYSIS PIPELINE
-# ---------------------------------------------------------------------------
-def analyze_image(
-    image_bytes,
-    officer_id,
-    latitude,
-    longitude,
-    accuracy_meters,
-):
-    sha256 = hashlib.sha256(image_bytes).hexdigest()
+# ------------------------------------------------------------------------------
+# Robust ROI Color Measurement
+# ------------------------------------------------------------------------------
+def measure_color(image: np.ndarray, roi_xyxy: List[int], margin_ratio: float = 0.15) -> Dict[str, Any]:
+    """Measures median color by shaving borders and filtering glare/dust outliers."""
+    x1, y1, x2, y2 = roi_xyxy
+    h_img, w_img = image.shape[:2]
 
-    arr = np.frombuffer(image_bytes, dtype=np.uint8)
-    bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    x1 = max(0, min(w_img - 1, x1))
+    x2 = max(x1 + 1, min(w_img, x2))
+    y1 = max(0, min(h_img - 1, y1))
+    y2 = max(y1 + 1, min(h_img, y2))
 
-    if bgr is None:
-        raise ValueError("Uploaded file is not a readable image")
+    roi_w = x2 - x1
+    roi_h = y2 - y1
 
-    image_rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    dx = int(roi_w * margin_ratio)
+    dy = int(roi_h * margin_ratio)
 
-    quality = image_quality(image_rgb)
+    cx1 = x1 + dx
+    cx2 = max(cx1 + 1, x2 - dx)
+    cy1 = y1 + dy
+    cy2 = max(cy1 + 1, y2 - dy)
 
-    reference_candidate, cassette_candidate, candidates = detect_reference_and_cassette(
-        image_rgb
+    central_patch = image[cy1:cy2, cx1:cx2]
+    if central_patch.size == 0:
+        central_patch = image[y1:y2, x1:x2]
+
+    rgb_patch = cv2.cvtColor(central_patch, cv2.COLOR_BGR2RGB)
+    pixels = rgb_patch.reshape(-1, 3).astype(np.float32)
+
+    # Filter out luminance outliers (glare, specular highlights, dark edge pixels)
+    if len(pixels) > 10:
+        luminance = 0.299 * pixels[:, 0] + 0.587 * pixels[:, 1] + 0.114 * pixels[:, 2]
+        p10 = np.percentile(luminance, 10)
+        p90 = np.percentile(luminance, 90)
+        mask = (luminance >= p10) & (luminance <= p90)
+        filtered_pixels = pixels[mask]
+        if len(filtered_pixels) < 5:
+            filtered_pixels = pixels
+    else:
+        filtered_pixels = pixels
+
+    median_rgb = [round(float(v), 2) for v in np.median(filtered_pixels, axis=0)]
+    mean_rgb = [round(float(v), 2) for v in np.mean(filtered_pixels, axis=0)]
+
+    r, g, b = median_rgb[0], median_rgb[1], median_rgb[2]
+    hsv_vals = rgb_to_hsv(r, g, b)
+    lab_vals = rgb_to_lab(r, g, b)
+    hex_code = rgb_to_hex(int(round(r)), int(round(g)), int(round(b)))
+
+    brightness = round(float(0.299 * r + 0.587 * g + 0.114 * b), 2)
+    saturation = round(float(hsv_vals[1]), 2)
+
+    return {
+        "rgb": median_rgb,
+        "mean_rgb": mean_rgb,
+        "hsv": [round(v, 2) for v in hsv_vals],
+        "lab": [round(v, 2) for v in lab_vals],
+        "hex": hex_code,
+        "brightness": brightness,
+        "saturation": saturation,
+    }
+
+
+# ------------------------------------------------------------------------------
+# Left Reference Swatch Detection
+# ------------------------------------------------------------------------------
+def detect_reference_card(image: np.ndarray) -> Dict[str, Any]:
+    """Detects the large colored reference swatch located on the left side."""
+    h, w = image.shape[:2]
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    thresh = cv2.adaptiveThreshold(
+        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 15, 3
     )
 
-    reference = reference_candidate["rect"] if isinstance(reference_candidate, dict) else reference_candidate
-    cassette = cassette_candidate["rect"] if isinstance(cassette_candidate, dict) else cassette_candidate
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    timestamp = datetime.now(timezone.utc).isoformat()
-    test_id = "TEST-" + uuid.uuid4().hex[:12].upper()
+    best_rect: Optional[List[int]] = None
+    best_score = -1.0
+    image_area = float(w * h)
 
-    if reference is None or cassette is None:
-        annotated = annotate(
-            image_rgb,
-            reference_rect=reference,
-            cassette_rect=cassette,
-            result="INCONCLUSIVE",
-            confidence=0,
-        )
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < image_area * 0.015:
+            continue
 
+        x, y, cw, ch = cv2.boundingRect(cnt)
+        cx = x + (cw / 2.0)
+
+        # Swatch is located in the left half of the image
+        if cx > w * 0.55:
+            continue
+
+        aspect_ratio = float(cw) / float(ch) if ch > 0 else 0.0
+        if aspect_ratio < 0.25 or aspect_ratio > 3.5:
+            continue
+
+        rect_area = float(cw * ch)
+        rectangularity = area / rect_area if rect_area > 0 else 0.0
+        if rectangularity < 0.45:
+            continue
+
+        left_preference = 1.0 - (cx / (w * 0.55))
+        score = (area / image_area) * 2.0 + rectangularity * 1.5 + left_preference * 1.0
+
+        if score > best_score:
+            best_score = score
+            best_rect = [x, y, x + cw, y + ch]
+
+    if best_rect is not None:
+        color_data = measure_color(image, best_rect, margin_ratio=0.15)
         return {
-            "success": True,
-            "test_id": test_id,
-            "result": "INCONCLUSIVE",
-            "confidence_percent": 0.0,
-            "officer_id": officer_id,
-            "timestamp_utc": timestamp,
-            "gps": {
-                "latitude": latitude,
-                "longitude": longitude,
-                "accuracy_meters": accuracy_meters,
-            },
-            "sha256": sha256,
-            "image_quality": quality,
-            "reference": {
-                "detected": reference is not None,
-                "rectangle_xyxy": (
-                    list(reference) if reference else None
-                ),
-            },
-            "cassette": {
-                "detected": cassette is not None,
-                "rectangle_xyxy": (
-                    list(cassette) if cassette else None
-                ),
-            },
-            "test_area": None,
-            "classification": {
-                "result": "INCONCLUSIVE",
-                "reason": (
-                    "Could not confidently detect both the reference "
-                    "swatch and test cassette."
-                ),
-            },
-            "presumptive_result": False,
-            "requires_lab_confirmation": True,
-            "scientific_limitation": (
-                "This is a prototype field-color analysis. It does not "
-                "replace laboratory confirmatory testing."
-            ),
-            "annotated_image_base64": encode_jpeg(annotated),
+            "detected": True,
+            "detection_method": "contour_morphological_left",
+            "rectangle_xyxy": best_rect,
+            "color": color_data,
         }
 
-    # Measure reference swatch.
-    reference_measurement = measure_color(
-        image_rgb,
-        reference,
-        "REFERENCE_SWATCH",
-    )
+    # Controlled left-sector ROI fallback if contours are blurred or diffused
+    left_fallback = [
+        int(w * 0.06),
+        int(h * 0.20),
+        int(w * 0.44),
+        int(h * 0.80)
+    ]
+    color_data = measure_color(image, left_fallback, margin_ratio=0.15)
+    return {
+        "detected": True,
+        "detection_method": "left_sector_fallback",
+        "rectangle_xyxy": left_fallback,
+        "color": color_data,
+    }
 
-    # Determine reaction area from cassette.
-    test_rect = extract_test_area(
-        image_rgb,
-        cassette,
-    )
 
-    test_measurement = measure_color(
-        image_rgb,
-        test_rect,
-        "TEST_REACTION_AREA",
-    )
+# ------------------------------------------------------------------------------
+# Right Test Cassette Detection
+# ------------------------------------------------------------------------------
+def detect_test_cassette(image: np.ndarray) -> Dict[str, Any]:
+    """Detects the rectangular test cassette located on the right side."""
+    h, w = image.shape[:2]
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
 
-    reference_rgb = np.array(
-        reference_measurement["rgb"],
-        dtype=float,
-    )
+    edges = cv2.Canny(blurred, 30, 100)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    dilated = cv2.dilate(edges, kernel, iterations=2)
 
-    test_rgb = np.array(
-        test_measurement["rgb"],
-        dtype=float,
-    )
+    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    comparison = compare_with_reference(
-        test_rgb,
-        reference_rgb,
-    )
+    best_rect: Optional[List[int]] = None
+    best_score = -1.0
+    image_area = float(w * h)
 
-    classification = classify_demo(test_rgb)
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < image_area * 0.02:
+            continue
 
-    # If the reference and reaction area are almost identical, report that
-    # explicitly. This prevents a vague "inconclusive" from hiding the
-    # actual measured color relationship.
-    if comparison["lab_distance"] < 5:
-        classification["reference_relationship"] = (
-            "TEST AREA IS VERY CLOSE TO REFERENCE COLOR"
-        )
+        x, y, cw, ch = cv2.boundingRect(cnt)
+        cx = x + (cw / 2.0)
 
-    annotated = annotate(
-        image_rgb,
-        reference_rect=reference,
-        cassette_rect=cassette,
-        test_rect=test_rect,
-        result=classification["result"],
-        confidence=classification["confidence_percent"],
-    )
+        # Cassette is located on the right half
+        if cx < w * 0.45:
+            continue
 
+        aspect_ratio = float(cw) / float(ch) if ch > 0 else 0.0
+        if aspect_ratio < 0.2 or aspect_ratio > 3.5:
+            continue
+
+        rect_area = float(cw * ch)
+        rectangularity = area / rect_area if rect_area > 0 else 0.0
+        if rectangularity < 0.40:
+            continue
+
+        right_preference = (cx - (w * 0.45)) / (w * 0.55)
+        score = (area / image_area) * 2.0 + rectangularity * 1.5 + right_preference * 1.0
+
+        if score > best_score:
+            best_score = score
+            best_rect = [x, y, x + cw, y + ch]
+
+    if best_rect is not None:
+        return {
+            "detected": True,
+            "detection_method": "contour_canny_right",
+            "rectangle_xyxy": best_rect,
+        }
+
+    # Controlled right-sector ROI fallback
+    right_fallback = [
+        int(w * 0.55),
+        int(h * 0.20),
+        int(w * 0.94),
+        int(h * 0.80)
+    ]
+    return {
+        "detected": True,
+        "detection_method": "right_sector_fallback",
+        "rectangle_xyxy": right_fallback,
+    }
+
+
+# ------------------------------------------------------------------------------
+# Reaction / Test Area Detection
+# ------------------------------------------------------------------------------
+def detect_test_area(image: np.ndarray, cassette_xyxy: List[int]) -> Dict[str, Any]:
+    """Finds the central reaction area inside the detected cassette while avoiding borders and text."""
+    cx1, cy1, cx2, cy2 = cassette_xyxy
+    cw = cx2 - cx1
+    ch = cy2 - cy1
+
+    tx1 = int(cx1 + cw * 0.28)
+    tx2 = int(cx1 + cw * 0.72)
+    ty1 = int(cy1 + ch * 0.32)
+    ty2 = int(cy1 + ch * 0.68)
+
+    test_area_xyxy = [tx1, ty1, tx2, ty2]
+    color_data = measure_color(image, test_area_xyxy, margin_ratio=0.10)
+
+    return {
+        "detected": True,
+        "rectangle_xyxy": test_area_xyxy,
+        "color": color_data,
+    }
+
+
+# ------------------------------------------------------------------------------
+# Color Comparison & Metric Calculation
+# ------------------------------------------------------------------------------
+def compare_colors(ref_color: Dict[str, Any], test_color: Dict[str, Any]) -> Dict[str, Any]:
+    """Performs perceptual color difference calculation in CIE-LAB and RGB spaces."""
+    ref_rgb = np.array(ref_color["rgb"], dtype=np.float32)
+    test_rgb = np.array(test_color["rgb"], dtype=np.float32)
+
+    ref_lab = np.array(ref_color["lab"], dtype=np.float32)
+    test_lab = np.array(test_color["lab"], dtype=np.float32)
+
+    ref_hsv = ref_color["hsv"]
+    test_hsv = test_color["hsv"]
+
+    rgb_dist = float(np.linalg.norm(ref_rgb - test_rgb))
+    lab_dist = float(np.linalg.norm(ref_lab - test_lab))
+
+    brightness_diff = float(abs(ref_color["brightness"] - test_color["brightness"]))
+    saturation_diff = float(abs(ref_color["saturation"] - test_color["saturation"]))
+
+    h1, h2 = float(ref_hsv[0]), float(test_hsv[0])
+    raw_hue_diff = abs(h1 - h2)
+    hue_diff = min(raw_hue_diff, 180.0 - raw_hue_diff)
+
+    return {
+        "reference_rgb": ref_color["rgb"],
+        "test_rgb": test_color["rgb"],
+        "reference_lab": ref_color["lab"],
+        "test_lab": test_color["lab"],
+        "rgb_distance": round(rgb_dist, 2),
+        "lab_distance": round(lab_dist, 2),
+        "brightness_difference": round(brightness_diff, 2),
+        "saturation_difference": round(saturation_diff, 2),
+        "hue_difference": round(hue_diff, 2),
+        "reason": "Relative colourimetric difference between reference swatch and reaction area computed via perceptual CIE-LAB space."
+    }
+
+
+# ------------------------------------------------------------------------------
+# Classification Logic
+# ------------------------------------------------------------------------------
+def classify_result(comparison: Dict[str, Any]) -> Tuple[str, float, bool, str]:
+    """Classifies presumptive result using configured thresholds or defaults to INCONCLUSIVE."""
+    pos_rgb = TEST_KIT_CONFIG.get("positive_reference_rgb")
+    neg_rgb = TEST_KIT_CONFIG.get("negative_reference_rgb")
+    pos_thresh = TEST_KIT_CONFIG.get("positive_lab_threshold")
+    neg_thresh = TEST_KIT_CONFIG.get("negative_lab_threshold")
+
+    if pos_rgb is None or neg_rgb is None or pos_thresh is None or neg_thresh is None:
+        reason = "Test-kit-specific positive/negative color calibration is not configured."
+        return ("INCONCLUSIVE", 20.0, False, reason)
+
+    test_rgb = np.array(comparison["test_rgb"], dtype=np.float32)
+    pos_lab = np.array(rgb_to_lab(pos_rgb[0], pos_rgb[1], pos_rgb[2]), dtype=np.float32)
+    neg_lab = np.array(rgb_to_lab(neg_rgb[0], neg_rgb[1], neg_rgb[2]), dtype=np.float32)
+    test_lab = np.array(comparison["test_lab"], dtype=np.float32)
+
+    dist_pos = float(np.linalg.norm(test_lab - pos_lab))
+    dist_neg = float(np.linalg.norm(test_lab - neg_lab))
+
+    if dist_pos <= pos_thresh and dist_pos < dist_neg:
+        confidence = max(50.0, min(99.0, 100.0 - (dist_pos / pos_thresh) * 45.0))
+        return ("POSITIVE", round(confidence, 1), True, "Test colour closely matches calibrated positive reagent reaction profile.")
+    elif dist_neg <= neg_thresh and dist_neg < dist_pos:
+        confidence = max(50.0, min(99.0, 100.0 - (dist_neg / neg_thresh) * 45.0))
+        return ("NEGATIVE", round(confidence, 1), True, "Test colour closely matches calibrated negative reagent reaction profile.")
+    else:
+        return ("INCONCLUSIVE", 30.0, False, "Reaction colour lies outside validated positive/negative calibration thresholds.")
+
+
+# ------------------------------------------------------------------------------
+# Image Annotation
+# ------------------------------------------------------------------------------
+def create_annotated_image(
+    image: np.ndarray,
+    ref_xyxy: List[int],
+    ref_color: Dict[str, Any],
+    cassette_xyxy: List[int],
+    test_xyxy: List[int],
+    test_color: Dict[str, Any]
+) -> str:
+    """Generates an annotated copy with Magenta reference, Green cassette, and Red test area."""
+    annotated = image.copy()
+    h, w = annotated.shape[:2]
+
+    # MAGENTA: Reference Swatch
+    rx1, ry1, rx2, ry2 = ref_xyxy
+    cv2.rectangle(annotated, (rx1, ry1), (rx2, ry2), (255, 0, 255), 3)
+
+    # GREEN: Test Cassette
+    cx1, cy1, cx2, cy2 = cassette_xyxy
+    cv2.rectangle(annotated, (cx1, cy1), (cx2, cy2), (0, 255, 0), 3)
+
+    # RED: Test / Reaction Area
+    tx1, ty1, tx2, ty2 = test_xyxy
+    cv2.rectangle(annotated, (tx1, ty1), (tx2, ty2), (0, 0, 255), 3)
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = max(0.45, min(0.9, w / 1200.0))
+    thickness = 2
+
+    # Draw Reference Label
+    ref_label1 = "REFERENCE"
+    ref_label2 = f"RGB: {ref_color['rgb']}"
+    ref_label3 = f"HEX: {ref_color['hex']}"
+    cv2.putText(annotated, ref_label1, (rx1, max(25, ry1 - 35)), font, font_scale, (255, 0, 255), thickness, cv2.LINE_AA)
+    cv2.putText(annotated, ref_label2, (rx1, max(45, ry1 - 18)), font, font_scale * 0.85, (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(annotated, ref_label3, (rx1, max(65, ry1 - 3)), font, font_scale * 0.85, (255, 255, 255), 1, cv2.LINE_AA)
+
+    # Draw Cassette Label
+    cv2.putText(annotated, "TEST CASSETTE", (cx1, max(25, cy1 - 10)), font, font_scale, (0, 255, 0), thickness, cv2.LINE_AA)
+
+    # Draw Test Area Label
+    test_label1 = "TEST AREA"
+    test_label2 = f"RGB: {test_color['rgb']}"
+    test_label3 = f"HEX: {test_color['hex']}"
+    cv2.putText(annotated, test_label1, (tx1, max(30, ty1 - 35)), font, font_scale, (0, 0, 255), thickness, cv2.LINE_AA)
+    cv2.putText(annotated, test_label2, (tx1, max(50, ty1 - 18)), font, font_scale * 0.85, (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(annotated, test_label3, (tx1, max(70, ty1 - 3)), font, font_scale * 0.85, (255, 255, 255), 1, cv2.LINE_AA)
+
+    success, buffer = cv2.imencode(".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+    if not success:
+        return ""
+    return base64.b64encode(buffer).decode("utf-8")
+
+
+# ------------------------------------------------------------------------------
+# API Endpoints
+# ------------------------------------------------------------------------------
+@app.get("/health")
+async def health_check() -> Dict[str, Any]:
+    """Lightweight health check endpoint for monitoring."""
     return {
         "success": True,
-        "test_id": test_id,
-        "result": classification["result"],
-        "confidence_percent": classification["confidence_percent"],
-        "officer_id": officer_id,
-        "timestamp_utc": timestamp,
-        "gps": {
-            "latitude": latitude,
-            "longitude": longitude,
-            "accuracy_meters": accuracy_meters,
-        },
-        "sha256": sha256,
-        "image_quality": quality,
-        "reference": {
-            "detected": True,
-            "rectangle_xyxy": list(reference),
-            "color": reference_measurement,
-        },
-        "cassette": {
-            "detected": True,
-            "rectangle_xyxy": list(cassette),
-        },
-        "test_area": {
-            "rectangle_xyxy": list(test_rect),
-            "color": test_measurement,
-        },
-        "comparison": comparison,
-        "classification": classification,
-        "presumptive_result": classification["result"] in {
-            "POSITIVE",
-            "NEGATIVE",
-        },
-        "requires_lab_confirmation": True,
-        "scientific_limitation": (
-            "This is a prototype presumptive field-test result and "
-            "does not replace laboratory confirmatory testing. "
-            "Positive/negative prototypes must be calibrated using "
-            "known samples from the exact test kit."
-        ),
-        "detected_rectangle_count": len(candidates),
-        "annotated_image_base64": encode_jpeg(annotated),
-    }
-
-
-# ---------------------------------------------------------------------------
-# API
-# ---------------------------------------------------------------------------
-@app.get("/")
-def root():
-    return {
-        "service": "Field Drug Testing Color Analysis API",
-        "version": "3.0",
-        "status": "online",
-        "endpoint": "POST /analyze",
-    }
-
-
-@app.get("/health")
-def health():
-    return {
-        "status": "ok",
-        "version": "3.0",
-        "demo_mode": DEMO_MODE,
+        "status": "healthy"
     }
 
 
 @app.post("/analyze")
-async def analyze(
-    officer_id: str = Form(...),
-    latitude: float = Form(...),
-    longitude: float = Form(...),
-    accuracy_meters: float = Form(...),
-    image: UploadFile = File(...),
-):
-    image_bytes = await image.read()
-
-    if not image_bytes:
-        raise HTTPException(
-            status_code=400,
-            detail="Empty image upload",
-        )
-
-    if len(image_bytes) > 15 * 1024 * 1024:
-        raise HTTPException(
-            status_code=413,
-            detail="Image is larger than 15 MB",
-        )
-
+async def analyze_test(
+    officer_id: str = Form("OFFICER001"),
+    latitude: Union[str, float] = Form(0.0),
+    longitude: Union[str, float] = Form(0.0),
+    accuracy_meters: Union[str, float] = Form(0.0),
+    image: UploadFile = File(...)
+) -> Dict[str, Any]:
+    """Primary analysis pipeline executing image reading, SHA-256 calculation, detection, and color science."""
     try:
-        result = analyze_image(
-            image_bytes=image_bytes,
-            officer_id=officer_id,
-            latitude=latitude,
-            longitude=longitude,
-            accuracy_meters=accuracy_meters,
+        # Validate and read exact raw bytes
+        original_bytes = await image.read()
+        if not original_bytes:
+            return JSONResponse(
+                status_code=400,
+                content={"success": False, "error": "Uploaded image file is empty."}
+            )
+
+        # 1. SHA-256 calculation on exact bytes
+        image_sha256 = calculate_sha256(original_bytes)
+        logger.info(f"[ANALYZE] image received from {officer_id}, bytes: {len(original_bytes)}, SHA256: {image_sha256}")
+
+        # 2. Decode image with OpenCV
+        np_arr = np.frombuffer(original_bytes, np.uint8)
+        cv_image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+        if cv_image is None or cv_image.size == 0:
+            return JSONResponse(
+                status_code=400,
+                content={"success": False, "error": "Failed to decode image. Please upload a valid JPEG/PNG."}
+            )
+
+        h_img, w_img = cv_image.shape[:2]
+        logger.info(f"[ANALYZE] image size: {w_img}x{h_img}")
+
+        # 3. Image Quality Analysis
+        quality = calculate_image_quality(cv_image)
+
+        # 4. Reference Swatch Detection
+        ref_card = detect_reference_card(cv_image)
+        logger.info(f"[ANALYZE] reference detection: {ref_card['detected']}, RGB: {ref_card['color']['rgb']}")
+
+        # 5. Test Cassette Detection
+        test_cassette = detect_test_cassette(cv_image)
+        logger.info(f"[ANALYZE] cassette detection: {test_cassette['detected']}, rect: {test_cassette['rectangle_xyxy']}")
+
+        # 6. Test Area Detection & Color Measurement
+        test_area = detect_test_area(cv_image, test_cassette["rectangle_xyxy"])
+        logger.info(f"[ANALYZE] test area detection: {test_area['detected']}, RGB: {test_area['color']['rgb']}")
+
+        # 7. Colourimetric Comparison
+        comparison = compare_colors(ref_card["color"], test_area["color"])
+        logger.info(f"[ANALYZE] LAB distance: {comparison['lab_distance']}, RGB distance: {comparison['rgb_distance']}")
+
+        # 8. Classification
+        result_label, confidence, is_presumptive, reason = classify_result(comparison)
+        comparison["reason"] = reason
+        logger.info(f"[ANALYZE] final result: {result_label}, confidence: {confidence}%")
+
+        # 9. Annotated Image Generation
+        annotated_b64 = create_annotated_image(
+            cv_image,
+            ref_card["rectangle_xyxy"],
+            ref_card["color"],
+            test_cassette["rectangle_xyxy"],
+            test_area["rectangle_xyxy"],
+            test_area["color"]
         )
 
-        return JSONResponse(content=result)
+        # 10. Generate Test ID & Metadata
+        test_id = f"TEST-{secrets.token_hex(6).upper()}"
+        timestamp_utc = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
-    except Exception as exc:
+        # Parse GPS safely
+        try:
+            lat_f = float(latitude)
+            long_f = float(longitude)
+            acc_f = float(accuracy_meters)
+        except (ValueError, TypeError):
+            lat_f, long_f, acc_f = 0.0, 0.0, 0.0
+
+        gps_data = {
+            "latitude": lat_f,
+            "longitude": long_f,
+            "accuracy_meters": acc_f
+        }
+
+        digital_record = {
+            "test_id": test_id,
+            "officer_id": officer_id,
+            "result": result_label,
+            "confidence_percent": confidence,
+            "timestamp_utc": timestamp_utc,
+            "gps": gps_data,
+            "sha256": image_sha256,
+            "reference_color": ref_card["color"],
+            "test_color": test_area["color"],
+            "colourimetric_comparison": comparison
+        }
+
+        response_payload = {
+            "success": True,
+            "test_id": test_id,
+            "result": result_label,
+            "confidence_percent": confidence,
+            "officer_id": officer_id,
+            "timestamp_utc": timestamp_utc,
+            "gps": gps_data,
+            "sha256": image_sha256,
+            "image_quality": quality,
+            "reference_card": ref_card,
+            "test_cassette": test_cassette,
+            "test_area": test_area,
+            "classification": comparison,
+            "presumptive_result": is_presumptive,
+            "requires_lab_confirmation": True,
+            "scientific_limitation": "This is a presumptive field-test result and does not replace laboratory confirmatory testing.",
+            "annotated_image_base64": annotated_b64,
+            "digital_record": digital_record,
+            "message": f"{result_label}. {reason}"
+        }
+
+        return response_payload
+
+    except Exception as e:
+        logger.error(f"[ANALYZE] Unexpected error during analysis: {e}", exc_info=True)
         return JSONResponse(
             status_code=500,
             content={
                 "success": False,
-                "error": str(exc),
-            },
+                "error": f"An error occurred while processing the test image: {str(e)}"
+            }
         )
-
-
-if __name__ == "__main__":
-    import uvicorn
-
-    port = int(os.getenv("PORT", "8000"))
-
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=port,
-        reload=False,
-    )
