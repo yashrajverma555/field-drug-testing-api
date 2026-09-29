@@ -1,3481 +1,838 @@
-"""
-Digital Companion for Field Drug Testing
-Single-file FastAPI backend for Flutter integration.
-
-Architecture:
-
-Flutter
-   |
-   | multipart/form-data
-   | officer_id + GPS + image
-   v
-FastAPI /analyze
-   |
-   v
-OpenCV preprocessing
-   |
-   +--> Reference card detection
-   +--> Reference colour extraction
-   +--> Colour calibration
-   +--> Test cassette detection
-   +--> Test-area extraction
-   +--> Image quality
-   +--> LAB colour classification
-   +--> Confidence
-   +--> SHA-256
-   |
-   v
-JSON + annotated image (base64)
-   |
-   v
-Flutter
-
-IMPORTANT:
-The classification prototype colours below are demonstration values only.
-They are NOT official drug-specific NCB/NCB-approved colour values.
-
-For actual deployment, replace the prototype colours with experimentally
-validated values for the exact field-test kit being used.
-"""
-
 import base64
 import hashlib
 import io
 import json
+import math
 import os
 import uuid
 from datetime import datetime, timezone
-from typing import Optional
 
 import cv2
 import numpy as np
-from PIL import Image
-
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
 
+app = FastAPI(title="Field Drug Testing Color Analysis API", version="3.0")
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
+# ---------------------------------------------------------------------------
+# CONFIG
+# ---------------------------------------------------------------------------
+# IMPORTANT:
+# These are DEMO prototypes only. Replace them with values measured from
+# known-positive and known-negative images of YOUR exact test kit.
+#
+# The screenshot supplied by the user contains:
+#   LEFT  = a large reference/color swatch
+#   RIGHT = test cassette
+# Therefore this version does NOT assume a 6-patch reference card.
+DEMO_POSITIVE_RGB = np.array([180.0, 70.0, 60.0])
+DEMO_NEGATIVE_RGB = np.array([215.0, 215.0, 215.0])
 
-CONFIG = {
-    # ------------------------------------------------------------------------
-    # Reference card:
-    #
-    # WHITE | GRAY | BLACK
-    # RED   | GREEN | BLUE
-    #
-    # RGB values.
-    # ------------------------------------------------------------------------
-    "reference_colors_rgb": {
-        "WHITE": [255, 255, 255],
-        "GRAY": [128, 128, 128],
-        "BLACK": [0, 0, 0],
-        "RED": [255, 0, 0],
-        "GREEN": [0, 255, 0],
-        "BLUE": [0, 0, 255],
-    },
+MAX_DISTANCE = float(os.getenv("MAX_DISTANCE", "90"))
+MIN_MARGIN = float(os.getenv("MIN_MARGIN", "12"))
+MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "55"))
 
-    # ------------------------------------------------------------------------
-    # DEMONSTRATION classification prototypes.
-    #
-    # These are NOT official drug-test colours.
-    #
-    # Replace with experimentally validated colours from the actual kit.
-    # Multiple prototype colours can be supplied for each category.
-    # ------------------------------------------------------------------------
-    "positive_prototypes_rgb": [
-        [180, 70, 60],
-        [150, 60, 50],
-    ],
-
-    "negative_prototypes_rgb": [
-        [215, 215, 215],
-        [190, 190, 190],
-    ],
-
-    "inconclusive_prototypes_rgb": [
-        [128, 128, 128],
-        [150, 130, 110],
-    ],
-
-    # ------------------------------------------------------------------------
-    # Rectangle detection.
-    # ------------------------------------------------------------------------
-    "min_card_area_ratio": 0.015,
-    "max_card_area_ratio": 0.70,
-
-    "min_cassette_area_ratio": 0.005,
-    "max_cassette_area_ratio": 0.70,
-
-    "min_rectangle_aspect": 0.30,
-    "max_rectangle_aspect": 4.50,
-
-    # ------------------------------------------------------------------------
-    # Image processing.
-    # ------------------------------------------------------------------------
-    "max_image_dimension": 1800,
-
-    # ------------------------------------------------------------------------
-    # Image quality.
-    # ------------------------------------------------------------------------
-    "minimum_quality_score": 55.0,
-    "minimum_sharpness": 35.0,
-
-    "minimum_brightness": 35.0,
-    "maximum_brightness": 225.0,
-
-    "minimum_contrast": 20.0,
-
-    "maximum_extreme_pixel_ratio": 0.35,
-
-    # ------------------------------------------------------------------------
-    # Calibration.
-    # ------------------------------------------------------------------------
-    "maximum_calibration_error_rgb": 75.0,
-    "minimum_calibration_valid_patches": 4,
-
-    # ------------------------------------------------------------------------
-    # Classification.
-    # ------------------------------------------------------------------------
-    "maximum_classification_distance": 70.0,
-    "maximum_inconclusive_distance": 90.0,
-
-    "minimum_positive_negative_margin": 8.0,
-    "minimum_relative_margin": 0.08,
-
-    "inconclusive_prototype_margin": 6.0,
-
-    # When calibration is imperfect, allow a conservative raw-colour
-    # fallback instead of automatically returning INCONCLUSIVE.
-    # This does NOT bypass strong distance/margin checks.
-    "allow_uncalibrated_fallback_classification": True,
-    "uncalibrated_maximum_classification_distance": 85.0,
-    "uncalibrated_minimum_positive_negative_margin": 12.0,
-    "uncalibrated_minimum_relative_margin": 0.12,
-    "uncalibrated_minimum_confidence": 55.0,
-
-    "maximum_confidence": 97.0,
-    "minimum_confidence_for_binary_result": 52.0,
-
-    # ------------------------------------------------------------------------
-    # Test area inside cassette.
-    # ------------------------------------------------------------------------
-    "test_area_x1": 0.20,
-    "test_area_y1": 0.25,
-    "test_area_x2": 0.80,
-    "test_area_y2": 0.75,
-
-    # ------------------------------------------------------------------------
-    # Reference patch extraction.
-    # ------------------------------------------------------------------------
-    "reference_patch_inner_ratio": 0.55,
-
-    # ------------------------------------------------------------------------
-    # Fallback detection.
-    # ------------------------------------------------------------------------
-    "allow_controlled_fallback_detection": True,
-
-    # ------------------------------------------------------------------------
-    # Uploaded image size safety limit.
-    # ------------------------------------------------------------------------
-    "maximum_upload_bytes": 15 * 1024 * 1024,
-}
+# Set DEMO_MODE=false after you have supplied real kit-specific prototypes.
+DEMO_MODE = os.getenv("DEMO_MODE", "true").lower() == "true"
 
 
-# ============================================================================
-# FASTAPI APPLICATION
-# ============================================================================
-
-app = FastAPI(
-    title="Digital Companion for Field Drug Testing",
-    description=(
-        "OpenCV-based presumptive field-test image analysis API."
-    ),
-    version="1.0.0",
-)
-
-# Prototype CORS configuration.
-# IMPORTANT: Restrict allow_origins in production.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ---------------------------------------------------------------------------
+# BASIC COLOR FUNCTIONS
+# ---------------------------------------------------------------------------
+def rgb_hex(rgb):
+    rgb = np.clip(np.asarray(rgb), 0, 255).astype(int)
+    return "#{:02X}{:02X}{:02X}".format(*rgb)
 
 
-# ============================================================================
-# GENERAL UTILITIES
-# ============================================================================
-
-def utc_now_iso():
-    return datetime.now(timezone.utc).isoformat()
+def rgb_to_hsv(rgb):
+    arr = np.array([[np.clip(rgb, 0, 255).astype(np.uint8)]])
+    return cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)[0, 0].astype(float)
 
 
-def clamp(value, minimum, maximum):
-    return max(
-        minimum,
-        min(maximum, value)
+def rgb_to_lab(rgb):
+    arr = np.array([[np.clip(rgb, 0, 255).astype(np.uint8)]])
+    return cv2.cvtColor(arr, cv2.COLOR_RGB2LAB)[0, 0].astype(float)
+
+
+def color_family(rgb):
+    hsv = rgb_to_hsv(rgb)
+    h, s, v = hsv
+
+    if s < 25 and v > 220:
+        return "WHITE"
+    if s < 30 and v < 65:
+        return "BLACK"
+    if s < 35:
+        return "GRAY"
+
+    if h < 10 or h >= 170:
+        return "RED"
+    if h < 22:
+        return "ORANGE"
+    if h < 38:
+        return "YELLOW"
+    if h < 85:
+        return "GREEN"
+    if h < 105:
+        return "CYAN"
+    if h < 135:
+        return "BLUE"
+    if h < 165:
+        return "PURPLE"
+    return "RED"
+
+
+def robust_color(roi_rgb):
+    """
+    Median RGB after trimming extreme brightness pixels.
+    This is much less sensitive to glare, shadows and small dirt spots
+    than a simple mean.
+    """
+    pixels = roi_rgb.reshape(-1, 3).astype(np.float32)
+
+    if len(pixels) < 20:
+        raise ValueError("ROI contains too few pixels")
+
+    brightness = (
+        0.2126 * pixels[:, 0]
+        + 0.7152 * pixels[:, 1]
+        + 0.0722 * pixels[:, 2]
     )
 
-
-def safe_float(value):
-    try:
-        if value is None or value == "":
-            return None
-        return float(value)
-    except Exception:
-        return None
-
-
-def rgb_to_hex(rgb):
-    values = [
-        int(clamp(float(x), 0, 255))
-        for x in rgb
-    ]
-
-    return "#{:02X}{:02X}{:02X}".format(
-        values[0],
-        values[1],
-        values[2]
-    )
-
-
-def robust_median_rgb(rgb_pixels):
-    if rgb_pixels is None:
-        return None
-
-    pixels = np.asarray(rgb_pixels)
-
-    if pixels.size == 0:
-        return None
-
-    if pixels.ndim == 1:
-        if pixels.size != 3:
-            return None
-
-        pixels = pixels.reshape(
-            1,
-            3
-        )
-
-    pixels = pixels.reshape(
-        -1,
-        3
-    ).astype(
-        np.float32
-    )
-
-    pixels = pixels[
-        np.isfinite(pixels).all(axis=1)
-    ]
+    p5, p95 = np.percentile(brightness, [5, 95])
+    keep = (brightness >= p5) & (brightness <= p95)
+    pixels = pixels[keep]
 
     if len(pixels) == 0:
-        return None
+        return np.median(roi_rgb.reshape(-1, 3), axis=0)
 
-    brightness = np.mean(
-        pixels,
-        axis=1
-    )
+    return np.median(pixels, axis=0)
 
-    if len(pixels) >= 20:
-        low = np.percentile(
-            brightness,
-            5
-        )
 
-        high = np.percentile(
-            brightness,
-            95
-        )
+def measure_color(image_rgb, rect, label):
+    x1, y1, x2, y2 = [int(v) for v in rect]
+    h, w = image_rgb.shape[:2]
 
-        filtered = pixels[
-            (brightness >= low) &
-            (brightness <= high)
-        ]
+    x1 = max(0, min(w - 1, x1))
+    y1 = max(0, min(h - 1, y1))
+    x2 = max(x1 + 1, min(w, x2))
+    y2 = max(y1 + 1, min(h, y2))
 
-        if len(filtered) >= 5:
-            pixels = filtered
+    # Ignore the border: sample only the middle 70%.
+    rw = x2 - x1
+    rh = y2 - y1
+    sx1 = x1 + int(rw * 0.15)
+    sy1 = y1 + int(rh * 0.15)
+    sx2 = x2 - int(rw * 0.15)
+    sy2 = y2 - int(rh * 0.15)
 
-    median = np.median(
-        pixels,
-        axis=0
-    )
+    roi = image_rgb[sy1:sy2, sx1:sx2]
 
-    return [
-        float(x)
-        for x in median
-    ]
-
-
-def image_to_bgr(image_rgb):
-    return cv2.cvtColor(
-        image_rgb,
-        cv2.COLOR_RGB2BGR
-    )
-
-
-def bgr_to_rgb(image_bgr):
-    return cv2.cvtColor(
-        image_bgr,
-        cv2.COLOR_BGR2RGB
-    )
-
-
-def order_points(points):
-    points = np.asarray(
-        points,
-        dtype=np.float32
-    )
-
-    rect = np.zeros(
-        (4, 2),
-        dtype=np.float32
-    )
-
-    total = points.sum(
-        axis=1
-    )
-
-    difference = np.diff(
-        points,
-        axis=1
-    ).reshape(-1)
-
-    rect[0] = points[
-        np.argmin(total)
-    ]
-
-    rect[2] = points[
-        np.argmax(total)
-    ]
-
-    rect[1] = points[
-        np.argmin(difference)
-    ]
-
-    rect[3] = points[
-        np.argmax(difference)
-    ]
-
-    return rect
-
-
-def rectangle_from_points(points):
-    points = np.asarray(
-        points,
-        dtype=np.float32
-    )
-
-    return (
-        int(np.min(points[:, 0])),
-        int(np.min(points[:, 1])),
-        int(np.max(points[:, 0])),
-        int(np.max(points[:, 1])),
-    )
-
-
-def rect_area(rect):
-    x1, y1, x2, y2 = rect
-
-    return max(
-        0,
-        x2 - x1
-    ) * max(
-        0,
-        y2 - y1
-    )
-
-
-def rect_center(rect):
-    x1, y1, x2, y2 = rect
-
-    return (
-        (x1 + x2) / 2.0,
-        (y1 + y2) / 2.0
-    )
-
-
-def clip_rect(
-    rect,
-    width,
-    height
-):
-    x1, y1, x2, y2 = rect
-
-    x1 = int(
-        clamp(
-            x1,
-            0,
-            width - 1
-        )
-    )
-
-    y1 = int(
-        clamp(
-            y1,
-            0,
-            height - 1
-        )
-    )
-
-    x2 = int(
-        clamp(
-            x2,
-            x1 + 1,
-            width
-        )
-    )
-
-    y2 = int(
-        clamp(
-            y2,
-            y1 + 1,
-            height
-        )
-    )
-
-    return (
-        x1,
-        y1,
-        x2,
-        y2
-    )
-
-
-def rectangles_overlap(a, b):
-    ax1, ay1, ax2, ay2 = a
-    bx1, by1, bx2, by2 = b
-
-    ix1 = max(
-        ax1,
-        bx1
-    )
-
-    iy1 = max(
-        ay1,
-        by1
-    )
-
-    ix2 = min(
-        ax2,
-        bx2
-    )
-
-    iy2 = min(
-        ay2,
-        by2
-    )
-
-    if ix2 <= ix1 or iy2 <= iy1:
-        return False
-
-    intersection = (
-        (ix2 - ix1) *
-        (iy2 - iy1)
-    )
-
-    union = (
-        rect_area(a) +
-        rect_area(b) -
-        intersection
-    )
-
-    if union <= 0:
-        return False
-
-    return (
-        intersection / union
-    ) > 0.40
-
-
-# ============================================================================
-# IMAGE PREPROCESSING
-# ============================================================================
-
-def decode_original_image(original_bytes):
-    if not original_bytes:
-        raise ValueError(
-            "The uploaded image is empty."
-        )
-
-    if len(original_bytes) > CONFIG[
-        "maximum_upload_bytes"
-    ]:
-        raise ValueError(
-            "The uploaded image is too large."
-        )
-
-    image_array = np.frombuffer(
-        original_bytes,
-        dtype=np.uint8
-    )
-
-    image_bgr = cv2.imdecode(
-        image_array,
-        cv2.IMREAD_COLOR
-    )
-
-    if image_bgr is None:
-        raise ValueError(
-            "The uploaded file could not be decoded as an image."
-        )
-
-    image_rgb = bgr_to_rgb(
-        image_bgr
-    )
-
-    if (
-        image_rgb.ndim != 3 or
-        image_rgb.shape[2] != 3
-    ):
-        raise ValueError(
-            "The decoded image is not a valid RGB image."
-        )
-
-    return image_rgb
-
-
-def resize_if_needed(image_rgb):
-    height, width = image_rgb.shape[:2]
-
-    maximum = CONFIG[
-        "max_image_dimension"
-    ]
-
-    if max(
-        height,
-        width
-    ) <= maximum:
-        return image_rgb.copy()
-
-    scale = (
-        maximum /
-        float(max(height, width))
-    )
-
-    new_width = max(
-        1,
-        int(width * scale)
-    )
-
-    new_height = max(
-        1,
-        int(height * scale)
-    )
-
-    return cv2.resize(
-        image_rgb,
-        (
-            new_width,
-            new_height
-        ),
-        interpolation=cv2.INTER_AREA
-    )
-
-
-def preprocess_image(image_rgb):
-    resized = resize_if_needed(
-        image_rgb
-    )
-
-    bgr = image_to_bgr(
-        resized
-    )
-
-    denoised_bgr = cv2.bilateralFilter(
-        bgr,
-        5,
-        35,
-        35
-    )
-
-    processed_rgb = bgr_to_rgb(
-        denoised_bgr
-    )
-
-    hsv = cv2.cvtColor(
-        processed_rgb,
-        cv2.COLOR_RGB2HSV
-    )
-
-    lab = cv2.cvtColor(
-        processed_rgb,
-        cv2.COLOR_RGB2LAB
-    )
+    rgb = robust_color(roi)
+    hsv = rgb_to_hsv(rgb)
+    lab = rgb_to_lab(rgb)
 
     return {
-        "rgb": processed_rgb,
-        "bgr": denoised_bgr,
-        "hsv": hsv,
-        "lab": lab,
+        "label": label,
+        "rectangle_xyxy": [sx1, sy1, sx2, sy2],
+        "rgb": [round(float(x), 2) for x in rgb],
+        "hex": rgb_hex(rgb),
+        "hsv": [round(float(x), 2) for x in hsv],
+        "lab": [round(float(x), 2) for x in lab],
+        "brightness": round(float(np.mean(rgb)), 2),
+        "saturation": round(float(hsv[1]), 2),
+        "color_family": color_family(rgb),
+        "pixel_count": int(roi.shape[0] * roi.shape[1]),
     }
 
 
-# ============================================================================
-# IMAGE QUALITY
-# ============================================================================
+# ---------------------------------------------------------------------------
+# GEOMETRY / RECTANGLE DETECTION
+# ---------------------------------------------------------------------------
+def order_quad(points):
+    pts = np.asarray(points, dtype=np.float32)
+    s = pts.sum(axis=1)
+    d = np.diff(pts, axis=1).reshape(-1)
 
-def calculate_image_quality(image_rgb):
-    gray = cv2.cvtColor(
-        image_rgb,
-        cv2.COLOR_RGB2GRAY
-    )
-
-    sharpness = float(
-        cv2.Laplacian(
-            gray,
-            cv2.CV_64F
-        ).var()
-    )
-
-    brightness = float(
-        np.mean(gray)
-    )
-
-    contrast = float(
-        np.std(gray)
-    )
-
-    extreme_low_ratio = float(
-        np.mean(gray <= 12)
-    )
-
-    extreme_high_ratio = float(
-        np.mean(gray >= 245)
-    )
-
-    extreme_ratio = (
-        extreme_low_ratio +
-        extreme_high_ratio
-    )
-
-    sharpness_score = clamp(
-        sharpness / 180.0 * 100.0,
-        0,
-        100
-    )
-
-    brightness_score = 100.0 - (
-        abs(brightness - 128.0) /
-        128.0 *
-        100.0
-    )
-
-    brightness_score = clamp(
-        brightness_score,
-        0,
-        100
-    )
-
-    contrast_score = clamp(
-        contrast / 65.0 * 100.0,
-        0,
-        100
-    )
-
-    extreme_score = clamp(
-        (
-            1.0 -
-            extreme_ratio /
-            CONFIG["maximum_extreme_pixel_ratio"]
-        ) * 100.0,
-        0,
-        100
-    )
-
-    quality_score = (
-        0.35 * sharpness_score +
-        0.25 * brightness_score +
-        0.20 * contrast_score +
-        0.20 * extreme_score
-    )
-
-    quality_score = clamp(
-        quality_score,
-        0,
-        100
-    )
-
-    brightness_ok = (
-        CONFIG["minimum_brightness"]
-        <= brightness
-        <= CONFIG["maximum_brightness"]
-    )
-
-    sharpness_ok = (
-        sharpness >=
-        CONFIG["minimum_sharpness"]
-    )
-
-    exposure_ok = (
-        extreme_ratio <=
-        CONFIG["maximum_extreme_pixel_ratio"]
-    )
-
-    contrast_ok = (
-        contrast >=
-        CONFIG["minimum_contrast"]
-    )
-
-    acceptable = (
-        quality_score >=
-        CONFIG["minimum_quality_score"]
-        and
-        brightness_ok
-        and
-        sharpness_ok
-        and
-        exposure_ok
-        and
-        contrast_ok
-    )
-
-    issues = []
-
-    if not sharpness_ok:
-        issues.append(
-            "image may be blurry"
-        )
-
-    if brightness < CONFIG[
-        "minimum_brightness"
-    ]:
-        issues.append(
-            "image is too dark"
-        )
-
-    if brightness > CONFIG[
-        "maximum_brightness"
-    ]:
-        issues.append(
-            "image is too bright"
-        )
-
-    if not contrast_ok:
-        issues.append(
-            "image contrast is low"
-        )
-
-    if not exposure_ok:
-        issues.append(
-            "too many clipped dark/bright pixels"
-        )
-
-    return {
-        "score": round(
-            float(quality_score),
-            2
-        ),
-        "quality_score": round(
-            float(quality_score),
-            2
-        ),
-        "acceptable": bool(
-            acceptable
-        ),
-        "sharpness": round(
-            float(sharpness),
-            2
-        ),
-        "brightness": round(
-            float(brightness),
-            2
-        ),
-        "contrast": round(
-            float(contrast),
-            2
-        ),
-        "extreme_pixel_ratio": round(
-            float(extreme_ratio),
-            4
-        ),
-        "brightness_ok": bool(
-            brightness_ok
-        ),
-        "sharpness_ok": bool(
-            sharpness_ok
-        ),
-        "exposure_ok": bool(
-            exposure_ok
-        ),
-        "contrast_ok": bool(
-            contrast_ok
-        ),
-        "issues": issues,
-    }
+    return np.array([
+        pts[np.argmin(s)],       # top-left
+        pts[np.argmin(d)],       # top-right
+        pts[np.argmax(s)],       # bottom-right
+        pts[np.argmax(d)],       # bottom-left
+    ], dtype=np.float32)
 
 
-# ============================================================================
-# RECTANGLE DETECTION
-# ============================================================================
-
-def four_point_rect(contour):
-    perimeter = cv2.arcLength(
-        contour,
-        True
-    )
-
-    if perimeter <= 0:
-        return None
-
-    approximation = cv2.approxPolyDP(
-        contour,
-        0.02 * perimeter,
-        True
-    )
-
-    if len(approximation) != 4:
-        return None
-
-    points = approximation.reshape(
-        4,
-        2
-    ).astype(
-        np.float32
-    )
-
-    return order_points(
-        points
-    )
+def rect_from_quad(q):
+    x1 = int(np.min(q[:, 0]))
+    y1 = int(np.min(q[:, 1]))
+    x2 = int(np.max(q[:, 0]))
+    y2 = int(np.max(q[:, 1]))
+    return (x1, y1, x2, y2)
 
 
-def detect_rectangle_candidates(image_rgb):
-    height, width = image_rgb.shape[:2]
+def find_rectangles(image_rgb):
+    """
+    Finds large rectangular objects using multiple threshold levels.
+    Returns candidates rather than blindly choosing the largest contour.
+    """
+    gray = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
 
-    gray = cv2.cvtColor(
-        image_rgb,
-        cv2.COLOR_RGB2GRAY
-    )
+    edge_sets = [
+        cv2.Canny(blur, 30, 100),
+        cv2.Canny(blur, 50, 150),
+        cv2.Canny(blur, 80, 200),
+    ]
 
-    gray = cv2.GaussianBlur(
-        gray,
-        (5, 5),
-        0
-    )
-
-    edges = cv2.Canny(
-        gray,
-        50,
-        150
-    )
-
-    kernel = np.ones(
-        (5, 5),
-        np.uint8
-    )
-
-    edges = cv2.morphologyEx(
-        edges,
-        cv2.MORPH_CLOSE,
-        kernel,
-        iterations=2
-    )
-
-    contours, _ = cv2.findContours(
-        edges,
-        cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_SIMPLE
-    )
-
+    h, w = gray.shape
+    image_area = h * w
     candidates = []
 
-    image_area = float(
-        width * height
-    )
-
-    for contour in contours:
-
-        area = float(
-            cv2.contourArea(contour)
+    for edges in edge_sets:
+        contours, _ = cv2.findContours(
+            edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
 
-        if area <= 0:
-            continue
+        for contour in contours:
+            area = cv2.contourArea(contour)
 
-        area_ratio = (
-            area /
-            image_area
-        )
-
-        if (
-            area_ratio < 0.003
-            or
-            area_ratio > 0.80
-        ):
-            continue
-
-        points = four_point_rect(
-            contour
-        )
-
-        if points is None:
-            x, y, rw, rh = cv2.boundingRect(
-                contour
-            )
-
-            if rw <= 0 or rh <= 0:
+            if area < image_area * 0.015:
                 continue
 
-            points = np.array(
-                [
-                    [x, y],
-                    [x + rw, y],
-                    [x + rw, y + rh],
-                    [x, y + rh],
+            peri = cv2.arcLength(contour, True)
+            approx = cv2.approxPolyDP(contour, 0.035 * peri, True)
+
+            if len(approx) != 4:
+                x, y, cw, ch = cv2.boundingRect(contour)
+                if cw * ch < image_area * 0.02:
+                    continue
+                q = np.array([
+                    [x, y], [x + cw, y],
+                    [x + cw, y + ch], [x, y + ch]
+                ], dtype=np.float32)
+            else:
+                q = order_quad(approx.reshape(4, 2))
+
+            rect = rect_from_quad(q)
+            x1, y1, x2, y2 = rect
+            rw = x2 - x1
+            rh = y2 - y1
+
+            if rw < 80 or rh < 80:
+                continue
+
+            aspect = rw / max(rh, 1)
+
+            # Cards/cassettes are normally not extremely thin.
+            if aspect < 0.35 or aspect > 3.5:
+                continue
+
+            fill = area / max(rw * rh, 1)
+
+            candidates.append({
+                "rect": rect,
+                "quad": q.tolist(),
+                "area": float(area),
+                "fill": float(fill),
+                "center": [
+                    float((x1 + x2) / 2),
+                    float((y1 + y2) / 2)
                 ],
-                dtype=np.float32
+            })
+
+    # De-duplicate near-identical rectangles.
+    unique = []
+    for c in sorted(candidates, key=lambda x: x["area"], reverse=True):
+        x1, y1, x2, y2 = c["rect"]
+        duplicate = False
+
+        for u in unique:
+            ux1, uy1, ux2, uy2 = u["rect"]
+
+            ix1 = max(x1, ux1)
+            iy1 = max(y1, uy1)
+            ix2 = min(x2, ux2)
+            iy2 = min(y2, uy2)
+
+            inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+            union = (
+                (x2 - x1) * (y2 - y1)
+                + (ux2 - ux1) * (uy2 - uy1)
+                - inter
             )
 
-        x1, y1, x2, y2 = rectangle_from_points(
-            points
-        )
+            if union > 0 and inter / union > 0.75:
+                duplicate = True
+                break
 
-        rw = x2 - x1
-        rh = y2 - y1
+        if not duplicate:
+            unique.append(c)
 
-        if rw <= 10 or rh <= 10:
-            continue
-
-        aspect = (
-            rw /
-            float(rh)
-        )
-
-        if not (
-            CONFIG["min_rectangle_aspect"]
-            <= aspect
-            <= CONFIG["max_rectangle_aspect"]
-        ):
-            continue
-
-        rectangular_area = float(
-            rw * rh
-        )
-
-        fill_ratio = (
-            area /
-            max(
-                rectangular_area,
-                1.0
-            )
-        )
-
-        if fill_ratio < 0.35:
-            continue
-
-        candidates.append(
-            {
-                "rect": clip_rect(
-                    (
-                        x1,
-                        y1,
-                        x2,
-                        y2
-                    ),
-                    width,
-                    height
-                ),
-                "area": area,
-                "area_ratio": area_ratio,
-                "aspect": aspect,
-                "fill_ratio": fill_ratio,
-                "center": rect_center(
-                    (
-                        x1,
-                        y1,
-                        x2,
-                        y2
-                    )
-                ),
-            }
-        )
-
-    return candidates
+    return unique
 
 
-def reference_card_layout_score(
-    image_rgb,
-    rect
-):
-    """Score whether a rectangle actually looks like the expected 2x3 colour card.
-
-    This is intentionally layout-based rather than relying only on rectangle size.
-    It prevents a large unrelated rectangle on the left side of the image from
-    being accepted as the reference card.
+def detect_reference_and_cassette(image_rgb):
     """
-    try:
-        measured, _ = extract_reference_patches(
-            image_rgb,
-            rect
-        )
-    except Exception:
-        return 0.0
+    For the user's shown layout:
+        reference card = left large rectangle
+        cassette       = right large rectangle
 
-    required = [
-        "WHITE", "GRAY", "BLACK",
-        "RED", "GREEN", "BLUE"
+    We score candidates by horizontal position, size and rectangularity.
+    """
+    h, w = image_rgb.shape[:2]
+    candidates = find_rectangles(image_rgb)
+
+    if not candidates:
+        return None, None, candidates
+
+    # Keep reasonably large objects.
+    candidates = [
+        c for c in candidates
+        if (c["rect"][2] - c["rect"][0]) *
+           (c["rect"][3] - c["rect"][1]) > 0.025 * w * h
     ]
 
-    if not all(name in measured for name in required):
-        return 0.0
+    if not candidates:
+        return None, None, []
 
-    def patch_hsv(rgb):
-        arr = np.asarray(rgb, dtype=np.uint8).reshape(1, 1, 3)
-        return cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)[0, 0].astype(float)
-
-    scores = []
-
-    # Achromatic patches should have low saturation.
-    for name in ["WHITE", "GRAY", "BLACK"]:
-        h, sat, value = patch_hsv(measured[name])
-        achromatic_score = clamp(
-            1.0 - sat / 90.0,
-            0.0,
-            1.0
-        )
-        scores.append(achromatic_score)
-
-    # White/gray/black should also have a sensible brightness ordering.
-    white_v = patch_hsv(measured["WHITE"])[2]
-    gray_v = patch_hsv(measured["GRAY"])[2]
-    black_v = patch_hsv(measured["BLACK"])[2]
-
-    ordering_score = (
-        (1.0 if white_v > gray_v + 10 else 0.0) +
-        (1.0 if gray_v > black_v + 10 else 0.0)
-    ) / 2.0
-    scores.append(ordering_score)
-
-    def hue_score(rgb, expected_hue):
-        h, sat, value = patch_hsv(rgb)
-        circular_distance = min(
-            abs(h - expected_hue),
-            180.0 - abs(h - expected_hue)
-        )
-        hue_match = clamp(
-            1.0 - circular_distance / 35.0,
-            0.0,
-            1.0
-        )
-        saturation_score = clamp(
-            (sat - 45.0) / 80.0,
-            0.0,
-            1.0
-        )
-        return 0.65 * hue_match + 0.35 * saturation_score
-
-    scores.extend([
-        hue_score(measured["RED"], 0.0),
-        hue_score(measured["GREEN"], 60.0),
-        hue_score(measured["BLUE"], 120.0),
-    ])
-
-    return float(np.mean(scores))
-
-
-def detect_reference_card(
-    image_rgb,
-    candidates
-):
-    height, width = image_rgb.shape[:2]
-
-    left_candidates = [
-        candidate
-        for candidate in candidates
-        if (
-            candidate["center"][0] < width * 0.60
-        )
-        and (
-            CONFIG["min_card_area_ratio"]
-            <= candidate["area_ratio"]
-            <= CONFIG["max_card_area_ratio"]
-        )
+    left = [
+        c for c in candidates
+        if c["center"][0] < 0.52 * w
     ]
 
-    scored = []
+    right = [
+        c for c in candidates
+        if c["center"][0] >= 0.48 * w
+    ]
 
-    for candidate in left_candidates:
-        score = reference_card_layout_score(
-            image_rgb,
-            candidate["rect"]
-        )
-        scored.append((score, candidate))
+    def score(c, desired_side):
+        cx = c["center"][0] / w
+        cy = c["center"][1] / h
 
-    scored.sort(
-        key=lambda item: (item[0], item[1]["area"]),
-        reverse=True
-    )
-
-    # A rectangle must actually resemble the 2x3 reference card.
-    if scored and scored[0][0] >= 0.55:
-        best_score, best_candidate = scored[0]
-        return (
-            best_candidate["rect"],
-            "automatic-layout"
+        side_score = (
+            (1.0 - cx) if desired_side == "left" else cx
         )
 
-    # Keep the old controlled fallback for prototype compatibility, but only
-    # accept it if its colour layout also looks like a reference card.
-    if CONFIG["allow_controlled_fallback_detection"]:
-        x1 = int(width * 0.03)
-        x2 = int(width * 0.43)
-        y1 = int(height * 0.15)
-        y2 = int(height * 0.85)
-
-        fallback = clip_rect(
-            (x1, y1, x2, y2),
-            width,
-            height
+        area_score = min(
+            1.0,
+            c["area"] / (0.12 * w * h)
         )
 
-        if reference_card_layout_score(image_rgb, fallback) >= 0.55:
-            return (
-                fallback,
-                "controlled-fallback-layout"
-            )
-
-    return (
-        None,
-        "failed"
-    )
-
-
-def detect_test_cassette(
-    image_rgb,
-    candidates,
-    reference_rect
-):
-    height, width = image_rgb.shape[:2]
-
-    reference_center = (
-        rect_center(reference_rect)
-        if reference_rect is not None
-        else (-1e9, -1e9)
-    )
-
-    right_candidates = []
-
-    for candidate in candidates:
-
-        center_x, center_y = candidate[
-            "center"
-        ]
-
-        if abs(
-            center_x -
-            reference_center[0]
-        ) < 30:
-            continue
-
-        if center_x <= width * 0.40:
-            continue
-
-        if not (
-            CONFIG["min_cassette_area_ratio"]
-            <= candidate["area_ratio"]
-            <= CONFIG["max_cassette_area_ratio"]
-        ):
-            continue
-
-        if (
-            reference_rect is not None
-            and rectangles_overlap(
-                reference_rect,
-                candidate["rect"]
-            )
-        ):
-            continue
-
-        right_candidates.append(
-            candidate
-        )
-
-    if right_candidates:
-
-        right_candidates.sort(
-            key=lambda candidate: (
-                -candidate["area"],
-                -candidate["center"][0]
-            )
-        )
+        vertical_score = 1.0 - min(abs(cy - 0.45), 0.45)
 
         return (
-            right_candidates[0]["rect"],
-            "automatic"
+            0.50 * side_score
+            + 0.30 * area_score
+            + 0.20 * vertical_score
         )
 
-    if CONFIG[
-        "allow_controlled_fallback_detection"
-    ]:
-
-        x1 = int(
-            width * 0.48
-        )
-
-        x2 = int(
-            width * 0.96
-        )
-
-        y1 = int(
-            height * 0.20
-        )
-
-        y2 = int(
-            height * 0.80
-        )
-
-        fallback = clip_rect(
-            (
-                x1,
-                y1,
-                x2,
-                y2
-            ),
-            width,
-            height
-        )
-
-        if (
-            reference_rect is None
-            or not rectangles_overlap(
-                reference_rect,
-                fallback
-            )
-        ):
-            return (
-                fallback,
-                "controlled-fallback"
-            )
-
-    return (
-        None,
-        "failed"
+    ref = max(
+        left or candidates,
+        key=lambda c: score(c, "left")
     )
 
-
-# ============================================================================
-# REFERENCE COLOUR PATCH EXTRACTION
-# ============================================================================
-
-def extract_reference_patches(
-    image_rgb,
-    card_rect
-):
-    x1, y1, x2, y2 = card_rect
-
-    card = image_rgb[
-        y1:y2,
-        x1:x2
+    remaining = [
+        c for c in candidates
+        if c is not ref
     ]
 
-    if card.size == 0:
-        raise ValueError(
-            "Reference card region is empty."
+    cassette = None
+
+    if remaining:
+        cassette = max(
+            right or remaining,
+            key=lambda c: score(c, "right")
         )
 
-    height, width = card.shape[:2]
+    return ref, cassette, candidates
 
-    if height < 30 or width < 30:
-        raise ValueError(
-            "Reference card is too small."
-        )
 
-    names = [
-        [
-            "WHITE",
-            "GRAY",
-            "BLACK"
-        ],
-        [
-            "RED",
-            "GREEN",
-            "BLUE"
-        ]
-    ]
-
-    measured = {}
-    patch_rectangles = {}
-
-    inner_ratio = CONFIG[
-        "reference_patch_inner_ratio"
-    ]
-
-    for row in range(2):
-
-        for column in range(3):
-
-            cell_x1 = int(
-                column *
-                width /
-                3.0
-            )
-
-            cell_x2 = int(
-                (column + 1) *
-                width /
-                3.0
-            )
-
-            cell_y1 = int(
-                row *
-                height /
-                2.0
-            )
-
-            cell_y2 = int(
-                (row + 1) *
-                height /
-                2.0
-            )
-
-            cell_width = (
-                cell_x2 -
-                cell_x1
-            )
-
-            cell_height = (
-                cell_y2 -
-                cell_y1
-            )
-
-            crop_width = int(
-                cell_width *
-                inner_ratio
-            )
-
-            crop_height = int(
-                cell_height *
-                inner_ratio
-            )
-
-            center_x = (
-                cell_x1 +
-                cell_x2
-            ) // 2
-
-            center_y = (
-                cell_y1 +
-                cell_y2
-            ) // 2
-
-            patch_x1 = max(
-                cell_x1,
-                center_x -
-                crop_width // 2
-            )
-
-            patch_x2 = min(
-                cell_x2,
-                center_x +
-                crop_width // 2
-            )
-
-            patch_y1 = max(
-                cell_y1,
-                center_y -
-                crop_height // 2
-            )
-
-            patch_y2 = min(
-                cell_y2,
-                center_y +
-                crop_height // 2
-            )
-
-            patch = card[
-                patch_y1:patch_y2,
-                patch_x1:patch_x2
-            ]
-
-            rgb = robust_median_rgb(
-                patch.reshape(
-                    -1,
-                    3
-                )
-            )
-
-            name = names[
-                row
-            ][
-                column
-            ]
-
-            if rgb is not None:
-                measured[name] = rgb
-
-            patch_rectangles[name] = (
-                x1 + patch_x1,
-                y1 + patch_y1,
-                x1 + patch_x2,
-                y1 + patch_y2,
-            )
-
-    return (
-        measured,
-        patch_rectangles
-    )
-
-
-# ============================================================================
-# COLOUR CALIBRATION
-# ============================================================================
-
-def build_color_calibration(
-    measured_colors
-):
-    expected_colors = CONFIG[
-        "reference_colors_rgb"
-    ]
-
-    source = []
-    target = []
-
-    patch_errors_before = {}
-
-    for name, expected_rgb in expected_colors.items():
-
-        if name not in measured_colors:
-            continue
-
-        measured = np.asarray(
-            measured_colors[name],
-            dtype=np.float64
-        )
-
-        expected = np.asarray(
-            expected_rgb,
-            dtype=np.float64
-        )
-
-        source.append(
-            measured
-        )
-
-        target.append(
-            expected
-        )
-
-        patch_errors_before[name] = float(
-            np.linalg.norm(
-                measured -
-                expected
-            )
-        )
-
-    minimum_patches = CONFIG[
-        "minimum_calibration_valid_patches"
-    ]
-
-    if len(source) < minimum_patches:
-
-        return {
-            "valid": False,
-            "reason": (
-                "Not enough reference colour patches "
-                "were successfully detected."
-            ),
-            "matrix": None,
-            "mean_error_before": None,
-            "mean_error_after": None,
-            "patch_errors_before": patch_errors_before,
-            "patch_errors_after": {},
-            "valid_patch_count": len(source),
-        }
-
-    X = np.asarray(
-        source,
-        dtype=np.float64
-    )
-
-    Y = np.asarray(
-        target,
-        dtype=np.float64
-    )
-
-    # Affine colour transformation:
-    #
-    # [R G B 1] * M = [R' G' B']
-    #
-    # This makes calibration mathematically affect the measured test colour.
-    X_augmented = np.hstack(
-        [
-            X,
-            np.ones(
-                (
-                    X.shape[0],
-                    1
-                ),
-                dtype=np.float64
-            ),
-        ]
-    )
-
-    try:
-
-        matrix, residuals, rank, singular_values = (
-            np.linalg.lstsq(
-                X_augmented,
-                Y,
-                rcond=None
-            )
-        )
-
-    except Exception as exc:
-
-        return {
-            "valid": False,
-            "reason": (
-                f"Calibration failed: {exc}"
-            ),
-            "matrix": None,
-            "mean_error_before": None,
-            "mean_error_after": None,
-            "patch_errors_before": patch_errors_before,
-            "patch_errors_after": {},
-            "valid_patch_count": len(source),
-        }
-
-    predicted = (
-        X_augmented @ matrix
-    )
-
-    errors_after = np.linalg.norm(
-        predicted -
-        Y,
-        axis=1
-    )
-
-    patch_errors_after = {}
-
-    names = [
-        name
-        for name in expected_colors.keys()
-        if name in measured_colors
-    ]
-
-    for index, name in enumerate(
-        names
-    ):
-        patch_errors_after[name] = float(
-            errors_after[index]
-        )
-
-    mean_before = float(
-        np.mean(
-            list(
-                patch_errors_before.values()
-            )
-        )
-    )
-
-    mean_after = float(
-        np.mean(
-            errors_after
-        )
-    )
-
-    valid = (
-        mean_after <=
-        CONFIG[
-            "maximum_calibration_error_rgb"
-        ]
-    )
-
-    return {
-        "valid": bool(valid),
-        "reason": (
-            "Calibration successful."
-            if valid
-            else
-            "Calibration error is above the configured limit."
-        ),
-        "matrix": matrix,
-        "mean_error_before": mean_before,
-        "mean_error_after": mean_after,
-        "patch_errors_before": patch_errors_before,
-        "patch_errors_after": patch_errors_after,
-        "valid_patch_count": len(source),
-        "rank": int(rank),
-    }
-
-
-def apply_color_calibration(
-    rgb_pixels,
-    calibration
-):
-    pixels = np.asarray(
-        rgb_pixels,
-        dtype=np.float64
-    )
-
-    original_shape = pixels.shape
-
-    if pixels.size == 0:
-        return pixels
-
-    pixels = pixels.reshape(
-        -1,
-        3
-    )
-
-    matrix = calibration.get(
-        "matrix"
-    )
-
-    if matrix is None:
-        return pixels.reshape(
-            original_shape
-        )
-
-    augmented = np.hstack(
-        [
-            pixels,
-            np.ones(
-                (
-                    pixels.shape[0],
-                    1
-                ),
-                dtype=np.float64
-            ),
-        ]
-    )
-
-    corrected = (
-        augmented @ matrix
-    )
-
-    corrected = np.clip(
-        corrected,
-        0,
-        255
-    )
-
-    return corrected.reshape(
-        original_shape
-    ).astype(
-        np.uint8
-    )
-
-
-def calibrate_entire_image(
-    image_rgb,
-    calibration
-):
-    if not calibration.get(
-        "valid",
-        False
-    ):
-        return image_rgb.copy()
-
-    height, width = image_rgb.shape[:2]
-
-    corrected = apply_color_calibration(
-        image_rgb.reshape(
-            -1,
-            3
-        ),
-        calibration
-    )
-
-    return corrected.reshape(
-        height,
-        width,
-        3
-    )
-
-
-# ============================================================================
+# ---------------------------------------------------------------------------
 # TEST AREA
-# ============================================================================
+# ---------------------------------------------------------------------------
+def extract_test_area(image_rgb, cassette_rect):
+    """
+    The screenshot shows the reaction area approximately in the middle
+    of the cassette. We deliberately avoid the cassette border.
 
-def extract_test_area(
-    image_rgb,
-    cassette_rect
-):
+    This is a geometry extractor, not a drug-result classifier.
+    """
     x1, y1, x2, y2 = cassette_rect
 
-    cassette = image_rgb[
-        y1:y2,
-        x1:x2
-    ]
+    w = x2 - x1
+    h = y2 - y1
 
-    if cassette.size == 0:
-        return (
-            None,
-            None
-        )
-
-    height, width = cassette.shape[:2]
-
-    if height < 20 or width < 20:
-        return (
-            None,
-            None
-        )
-
-    rx1 = int(
-        width *
-        CONFIG["test_area_x1"]
-    )
-
-    ry1 = int(
-        height *
-        CONFIG["test_area_y1"]
-    )
-
-    rx2 = int(
-        width *
-        CONFIG["test_area_x2"]
-    )
-
-    ry2 = int(
-        height *
-        CONFIG["test_area_y2"]
-    )
-
-    rx1 = int(
-        clamp(
-            rx1,
-            0,
-            width - 1
-        )
-    )
-
-    ry1 = int(
-        clamp(
-            ry1,
-            0,
-            height - 1
-        )
-    )
-
-    rx2 = int(
-        clamp(
-            rx2,
-            rx1 + 1,
-            width
-        )
-    )
-
-    ry2 = int(
-        clamp(
-            ry2,
-            ry1 + 1,
-            height
-        )
-    )
-
-    test_area = cassette[
-        ry1:ry2,
-        rx1:rx2
-    ]
-
-    absolute_rect = (
-        x1 + rx1,
-        y1 + ry1,
-        x1 + rx2,
-        y1 + ry2
-    )
-
-    if test_area.size == 0:
-        return (
-            None,
-            None
-        )
+    # Central reaction region.
+    tx1 = x1 + int(w * 0.22)
+    tx2 = x1 + int(w * 0.78)
+    ty1 = y1 + int(h * 0.20)
+    ty2 = y1 + int(h * 0.80)
 
     return (
-        test_area,
-        absolute_rect
+        tx1, ty1, tx2, ty2
     )
 
 
-def extract_test_colour(
-    test_area_rgb
-):
-    if test_area_rgb is None:
-        return None
-
-    pixels = test_area_rgb.reshape(
-        -1,
-        3
-    ).astype(
-        np.float32
-    )
-
-    if len(pixels) < 10:
-        return None
-
-    hsv = cv2.cvtColor(
-        test_area_rgb,
-        cv2.COLOR_RGB2HSV
-    ).reshape(
-        -1,
-        3
-    )
-
-    value = hsv[
-        :,
-        2
-    ].astype(
-        np.float32
-    )
-
-    low = np.percentile(
-        value,
-        5
-    )
-
-    high = np.percentile(
-        value,
-        95
-    )
-
-    valid = (
-        (value >= low)
-        &
-        (value <= high)
-    )
-
-    filtered = pixels[
-        valid
-    ]
-
-    if len(filtered) < 10:
-        filtered = pixels
-
-    return robust_median_rgb(
-        filtered
-    )
+# ---------------------------------------------------------------------------
+# COLOR COMPARISON
+# ---------------------------------------------------------------------------
+def lab_distance(rgb_a, rgb_b):
+    a = rgb_to_lab(rgb_a)
+    b = rgb_to_lab(rgb_b)
+    return float(np.linalg.norm(a - b))
 
 
-# ============================================================================
-# LAB DISTANCE
-# ============================================================================
-
-def rgb_to_lab_single(
-    rgb
-):
-    array = np.asarray(
-        rgb,
-        dtype=np.float32
-    ).reshape(
-        1,
-        1,
-        3
-    )
-
-    array = np.clip(
-        array,
-        0,
-        255
-    ).astype(
-        np.uint8
-    )
-
-    lab = cv2.cvtColor(
-        array,
-        cv2.COLOR_RGB2LAB
-    )
-
-    return lab[
-        0,
-        0
-    ].astype(
-        np.float32
-    )
-
-
-def rgb_to_lab_batch(
-    rgb_list
-):
-    array = np.asarray(
-        rgb_list,
-        dtype=np.float32
-    )
-
-    if array.ndim == 1:
-        array = array.reshape(
-            1,
-            3
-        )
-
-    array = np.clip(
-        array,
-        0,
-        255
-    ).astype(
-        np.uint8
-    )
-
-    array = array.reshape(
-        -1,
-        1,
-        3
-    )
-
-    lab = cv2.cvtColor(
-        array,
-        cv2.COLOR_RGB2LAB
-    )
-
-    return lab.reshape(
-        -1,
-        3
-    ).astype(
-        np.float32
-    )
-
-
-def calculate_category_distance(
-    test_rgb,
-    prototype_list
-):
-    if not prototype_list:
-        return float("inf")
-
-    test_lab = rgb_to_lab_single(
-        test_rgb
-    )
-
-    prototypes_lab = rgb_to_lab_batch(
-        prototype_list
-    )
-
-    distances = np.linalg.norm(
-        prototypes_lab -
-        test_lab,
-        axis=1
-    )
-
-    return float(
-        np.min(distances)
-    )
-
-
-# ============================================================================
-# CLASSIFICATION
-# ============================================================================
-
-def classify_test_colour(
-    test_rgb,
-    quality,
-    calibration
-):
-    if test_rgb is None:
-        return {
-            "result": "INCONCLUSIVE",
-            "confidence_percent": 0.0,
-            "distances": {},
-            "reason": (
-                "Test colour could not be extracted. "
-                "Retake Image."
-            ),
-        }
-
-    if not quality[
-        "acceptable"
-    ]:
-        return {
-            "result": "INCONCLUSIVE",
-            "confidence_percent": round(
-                min(
-                    quality[
-                        "quality_score"
-                    ],
-                    49.0
-                ),
-                2
-            ),
-            "distances": {},
-            "reason": (
-                "Image quality is insufficient for reliable "
-                "colour classification. Retake Image."
-            ),
-        }
-
-    calibration_valid = bool(
-        calibration.get(
-            "valid",
-            False
-        )
-    )
-
-    if (
-        not calibration_valid
-        and
-        not CONFIG["allow_uncalibrated_fallback_classification"]
-    ):
-        return {
-            "result": "INCONCLUSIVE",
-            "confidence_percent": 20.0,
-            "distances": {},
-            "reason": (
-                "Reference-card calibration failed; classification "
-                "was intentionally stopped."
-            ),
-            "calibration_valid": False,
-        }
-
-    positive_distance = (
-        calculate_category_distance(
-            test_rgb,
-            CONFIG[
-                "positive_prototypes_rgb"
-            ]
-        )
-    )
-
-    negative_distance = (
-        calculate_category_distance(
-            test_rgb,
-            CONFIG[
-                "negative_prototypes_rgb"
-            ]
-        )
-    )
-
-    inconclusive_distance = (
-        calculate_category_distance(
-            test_rgb,
-            CONFIG[
-                "inconclusive_prototypes_rgb"
-            ]
-        )
-    )
-
-    distances = {
-        "positive": round(
-            positive_distance,
-            3
+def compare_with_reference(test_rgb, reference_rgb):
+    """
+    Measures whether the test region differs from the local reference.
+    Useful for detecting a color reaction, but NOT sufficient by itself
+    to establish a drug-positive result.
+    """
+    return {
+        "rgb_difference": [
+            round(float(test_rgb[i] - reference_rgb[i]), 2)
+            for i in range(3)
+        ],
+        "absolute_rgb_difference": round(
+            float(np.linalg.norm(test_rgb - reference_rgb)), 2
         ),
-        "negative": round(
-            negative_distance,
-            3
-        ),
-        "inconclusive": round(
-            inconclusive_distance,
-            3
+        "lab_distance": round(
+            lab_distance(test_rgb, reference_rgb), 2
         ),
     }
 
-    binary = [
-        (
-            "POSITIVE",
-            positive_distance
-        ),
-        (
-            "NEGATIVE",
-            negative_distance
-        ),
-    ]
 
-    binary.sort(
-        key=lambda item: item[1]
+def classify_demo(test_rgb):
+    """
+    Conservative prototype classifier.
+
+    Uses LAB distance to kit-specific prototypes.
+    Defaults are DEMO values and must be replaced with measurements from
+    known samples of the exact kit.
+    """
+    d_pos = lab_distance(test_rgb, DEMO_POSITIVE_RGB)
+    d_neg = lab_distance(test_rgb, DEMO_NEGATIVE_RGB)
+
+    nearest = "POSITIVE" if d_pos < d_neg else "NEGATIVE"
+    nearest_distance = min(d_pos, d_neg)
+    margin = abs(d_pos - d_neg)
+
+    # Confidence rises when the nearest class is close AND clearly
+    # separated from the other class.
+    separation = margin / max(d_pos + d_neg, 1.0)
+    closeness = max(0.0, 1.0 - nearest_distance / 150.0)
+
+    confidence = (
+        100.0 * (0.65 * separation + 0.35 * closeness)
     )
+    confidence = float(np.clip(confidence, 0, 99))
 
-    best_label = binary[0][0]
-    best_distance = binary[0][1]
-
-    second_label = binary[1][0]
-    second_distance = binary[1][1]
-
-    absolute_margin = (
-        second_distance -
-        best_distance
-    )
-
-    relative_margin = (
-        absolute_margin /
-        max(
-            second_distance,
-            1.0
+    if nearest_distance > MAX_DISTANCE:
+        result = "INCONCLUSIVE"
+        reason = (
+            "Measured test color is outside the configured kit color "
+            "range."
         )
-    )
-
-    if inconclusive_distance <= (
-        best_distance +
-        CONFIG[
-            "inconclusive_prototype_margin"
-        ]
-    ):
-        return {
-            "result": "INCONCLUSIVE",
-            "confidence_percent": round(
-                clamp(
-                    40.0 -
-                    inconclusive_distance *
-                    0.15,
-                    10.0,
-                    45.0
-                ),
-                2
-            ),
-            "distances": distances,
-            "reason": (
-                "Measured colour is too close to the "
-                "configured ambiguous/inconclusive region."
-            ),
-        }
-
-    maximum_distance = (
-        CONFIG["maximum_classification_distance"]
-        if calibration_valid
-        else CONFIG["uncalibrated_maximum_classification_distance"]
-    )
-
-    if best_distance > maximum_distance:
-        return {
-            "result": "INCONCLUSIVE",
-            "confidence_percent": round(
-                clamp(
-                    35.0 -
-                    best_distance *
-                    0.05,
-                    5.0,
-                    35.0
-                ),
-                2
-            ),
-            "distances": distances,
-            "reason": (
-                "Measured colour is too far from the configured "
-                "positive and negative prototype colours."
-            ),
-        }
-
-    if calibration_valid:
-        minimum_margin = CONFIG["minimum_positive_negative_margin"]
-        minimum_relative_margin = CONFIG["minimum_relative_margin"]
+    elif margin < MIN_MARGIN:
+        result = "INCONCLUSIVE"
+        reason = (
+            "Positive and negative prototype colors are too close to "
+            "the measured test color."
+        )
+    elif confidence < MIN_CONFIDENCE:
+        result = "INCONCLUSIVE"
+        reason = "Color separation is insufficient."
     else:
-        minimum_margin = CONFIG["uncalibrated_minimum_positive_negative_margin"]
-        minimum_relative_margin = CONFIG["uncalibrated_minimum_relative_margin"]
-
-    if absolute_margin < minimum_margin:
-        return {
-            "result": "INCONCLUSIVE",
-            "confidence_percent": round(
-                clamp(
-                    45.0 +
-                    absolute_margin *
-                    1.5,
-                    20.0,
-                    55.0
-                ),
-                2
-            ),
-            "distances": distances,
-            "reason": (
-                f"{best_label} and {second_label} are too close "
-                "in LAB colour distance."
-            ),
-        }
-
-    if relative_margin < minimum_relative_margin:
-        return {
-            "result": "INCONCLUSIVE",
-            "confidence_percent": round(
-                clamp(
-                    45.0 +
-                    relative_margin *
-                    80.0,
-                    20.0,
-                    55.0
-                ),
-                2
-            ),
-            "distances": distances,
-            "reason": (
-                "Best-vs-second-best colour margin is too small."
-            ),
-        }
-
-    distance_score = (
-        1.0 -
-        best_distance /
-        max(
-            maximum_distance,
-            1.0
+        result = nearest
+        reason = (
+            "Prototype color comparison passed the configured "
+            "distance/separation checks."
         )
-    )
-
-    distance_score = clamp(
-        distance_score,
-        0.0,
-        1.0
-    )
-
-    margin_score = clamp(
-        relative_margin / 0.50,
-        0.0,
-        1.0
-    )
-
-    quality_score = (
-        quality["quality_score"] / 100.0
-    )
-
-    if calibration_valid:
-        calibration_error = calibration.get(
-            "mean_error_after"
-        )
-        calibration_score = 1.0 - clamp(
-            float(calibration_error or 0.0) /
-            max(CONFIG["maximum_calibration_error_rgb"], 1.0),
-            0.0,
-            1.0
-        )
-
-        confidence = (
-            0.40 * distance_score +
-            0.25 * margin_score +
-            0.20 * quality_score +
-            0.15 * calibration_score
-        ) * 100.0
-
-        minimum_confidence = CONFIG[
-            "minimum_confidence_for_binary_result"
-        ]
-        reason_suffix = (
-            "Reference-card calibration was valid."
-        )
-    else:
-        # Conservative raw-colour fallback. We only reach this path after
-        # stronger distance/margin gates above have passed.
-        confidence = (
-            0.45 * distance_score +
-            0.35 * margin_score +
-            0.20 * quality_score
-        ) * 100.0
-
-        minimum_confidence = CONFIG[
-            "uncalibrated_minimum_confidence"
-        ]
-        reason_suffix = (
-            "Reference-card calibration was imperfect, so the result "
-            "was obtained from the original measured test colour; "
-            "verify against the physical kit/lab workflow."
-        )
-
-    confidence = clamp(
-        confidence,
-        0.0,
-        CONFIG["maximum_confidence"]
-    )
-
-    if confidence < minimum_confidence:
-        return {
-            "result": "INCONCLUSIVE",
-            "confidence_percent": round(confidence, 2),
-            "distances": distances,
-            "reason": (
-                "Colour similarity and separation are not strong enough "
-                "for a binary result. " + reason_suffix
-            ),
-            "calibration_valid": calibration_valid,
-            "best_category": best_label,
-            "second_category": second_label,
-            "best_distance": round(best_distance, 3),
-            "second_distance": round(second_distance, 3),
-            "absolute_margin": round(absolute_margin, 3),
-            "relative_margin": round(relative_margin, 4),
-        }
 
     return {
-        "result": best_label,
-        "confidence_percent": round(
-            confidence,
-            2
-        ),
-        "distances": distances,
-        "reason": (
-            f"{best_label} has the lowest LAB colour distance "
-            f"with an adequate best-vs-second-best margin. "
-            f"{reason_suffix}"
-        ),
-        "calibration_valid": calibration_valid,
-        "best_category": best_label,
-        "second_category": second_label,
-        "best_distance": round(
-            best_distance,
-            3
-        ),
-        "second_distance": round(
-            second_distance,
-            3
-        ),
-        "absolute_margin": round(
-            absolute_margin,
-            3
-        ),
-        "relative_margin": round(
-            relative_margin,
-            4
-        ),
+        "result": result,
+        "confidence_percent": round(confidence, 1),
+        "positive_distance_lab": round(d_pos, 2),
+        "negative_distance_lab": round(d_neg, 2),
+        "margin": round(margin, 2),
+        "reason": reason,
+        "prototype_mode": "DEMO" if DEMO_MODE else "KIT_SPECIFIC",
+        "positive_prototype_rgb": DEMO_POSITIVE_RGB.tolist(),
+        "negative_prototype_rgb": DEMO_NEGATIVE_RGB.tolist(),
     }
 
 
-# ============================================================================
-# ANNOTATED IMAGE
-# ============================================================================
-
-def draw_label(
-    image,
-    text,
-    origin,
-    color,
-    background=(30, 30, 30)
-):
-    x, y = origin
-
-    font = cv2.FONT_HERSHEY_SIMPLEX
-
-    scale = 0.65
-    thickness = 2
-
-    (text_width, text_height), baseline = (
-        cv2.getTextSize(
-            text,
-            font,
-            scale,
-            thickness
-        )
-    )
-
-    cv2.rectangle(
-        image,
-        (
-            max(
-                0,
-                x - 4
-            ),
-            max(
-                0,
-                y -
-                text_height -
-                baseline -
-                8
-            )
-        ),
-        (
-            min(
-                image.shape[1] - 1,
-                x +
-                text_width +
-                8
-            ),
-            min(
-                image.shape[0] - 1,
-                y + 5
-            )
-        ),
-        background,
-        -1
-    )
-
-    cv2.putText(
-        image,
-        text,
-        (
-            x,
-            y
-        ),
-        font,
-        scale,
-        color,
-        thickness,
-        cv2.LINE_AA
-    )
-
-
-def annotate_image(
+# ---------------------------------------------------------------------------
+# IMAGE ANNOTATION
+# ---------------------------------------------------------------------------
+def annotate(
     image_rgb,
-    reference_rect,
-    cassette_rect,
-    test_rect,
-    result,
-    confidence
+    reference_rect=None,
+    cassette_rect=None,
+    test_rect=None,
+    result="INCONCLUSIVE",
+    confidence=0,
 ):
-    annotated = image_rgb.copy()
+    out = cv2.cvtColor(image_rgb.copy(), cv2.COLOR_RGB2BGR)
 
-    bgr = image_to_bgr(
-        annotated
-    )
-
-    cyan = (
-        255,
-        255,
-        0
-    )
-
-    green = (
-        0,
-        220,
-        0
-    )
-
-    red = (
-        0,
-        0,
-        255
-    )
-
-    white = (
-        255,
-        255,
-        255
-    )
-
-    if reference_rect is not None:
-
-        x1, y1, x2, y2 = reference_rect
-
+    if reference_rect:
+        x1, y1, x2, y2 = map(int, reference_rect)
         cv2.rectangle(
-            bgr,
-            (
-                x1,
-                y1
-            ),
-            (
-                x2,
-                y2
-            ),
-            cyan,
-            2
+            out, (x1, y1), (x2, y2),
+            (255, 0, 255), 4
+        )
+        cv2.putText(
+            out,
+            "REFERENCE",
+            (x1, max(30, y1 - 10)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (255, 0, 255),
+            2,
+            cv2.LINE_AA,
         )
 
-        draw_label(
-            bgr,
-            "REFERENCE CARD",
-            (
-                x1,
-                max(
-                    25,
-                    y1 - 8
-                )
-            ),
-            white
-        )
-
-    if cassette_rect is not None:
-
-        x1, y1, x2, y2 = cassette_rect
-
+    if cassette_rect:
+        x1, y1, x2, y2 = map(int, cassette_rect)
         cv2.rectangle(
-            bgr,
-            (
-                x1,
-                y1
-            ),
-            (
-                x2,
-                y2
-            ),
-            green,
-            2
+            out, (x1, y1), (x2, y2),
+            (0, 255, 0), 4
         )
-
-        draw_label(
-            bgr,
+        cv2.putText(
+            out,
             "TEST CASSETTE",
-            (
-                x1,
-                max(
-                    25,
-                    y1 - 8
-                )
-            ),
-            white
+            (x1, max(30, y1 - 10)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 0),
+            2,
+            cv2.LINE_AA,
         )
 
-    if test_rect is not None:
-
-        x1, y1, x2, y2 = test_rect
-
+    if test_rect:
+        x1, y1, x2, y2 = map(int, test_rect)
         cv2.rectangle(
-            bgr,
-            (
-                x1,
-                y1
-            ),
-            (
-                x2,
-                y2
-            ),
-            red,
-            2
+            out, (x1, y1), (x2, y2),
+            (0, 0, 255), 4
         )
 
-        label_y = min(
-            bgr.shape[0] - 10,
-            y2 + 25
+        text = f"{result}  {confidence:.1f}%"
+
+        cv2.putText(
+            out,
+            text,
+            (x1, max(30, y1 - 10)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.75,
+            (0, 0, 255),
+            2,
+            cv2.LINE_AA,
         )
 
-        draw_label(
-            bgr,
-            result,
-            (
-                x1,
-                label_y
-            ),
-            white
-        )
-
-        draw_label(
-            bgr,
-            f"Confidence: {confidence:.1f}%",
-            (
-                x1,
-                min(
-                    bgr.shape[0] - 10,
-                    label_y + 28
-                )
-            ),
-            white
-        )
-
-    return bgr_to_rgb(
-        bgr
-    )
+    return cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
 
 
-def encode_annotated_image(
-    image_rgb
-):
-    image_bgr = image_to_bgr(
-        image_rgb
-    )
-
-    success, encoded = cv2.imencode(
+def encode_jpeg(image_rgb):
+    ok, buffer = cv2.imencode(
         ".jpg",
-        image_bgr,
-        [
-            int(
-                cv2.IMWRITE_JPEG_QUALITY
-            ),
-            90,
-        ]
+        cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR),
+        [cv2.IMWRITE_JPEG_QUALITY, 92],
     )
 
-    if not success:
-        raise ValueError(
-            "Could not encode annotated image."
-        )
+    if not ok:
+        raise RuntimeError("Could not encode annotated image")
 
-    return base64.b64encode(
-        encoded.tobytes()
-    ).decode(
-        "utf-8"
-    )
+    return base64.b64encode(buffer.tobytes()).decode("ascii")
 
 
-# ============================================================================
-# DIGITAL RECORD
-# ============================================================================
+# ---------------------------------------------------------------------------
+# QUALITY CHECK
+# ---------------------------------------------------------------------------
+def image_quality(image_rgb):
+    gray = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
 
-def build_digital_record(
-    test_id,
-    result,
-    confidence,
+    brightness = float(np.mean(gray))
+    contrast = float(np.std(gray))
+    sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+    # These are image-quality indicators only.
+    score = 100.0
+
+    if brightness < 45 or brightness > 235:
+        score -= 25
+
+    if contrast < 15:
+        score -= 20
+
+    if sharpness < 30:
+        score -= 25
+
+    score = float(np.clip(score, 0, 100))
+
+    return {
+        "score": round(score, 1),
+        "brightness": round(brightness, 2),
+        "contrast": round(contrast, 2),
+        "sharpness": round(sharpness, 2),
+        "acceptable": score >= 50,
+    }
+
+
+# ---------------------------------------------------------------------------
+# ANALYSIS PIPELINE
+# ---------------------------------------------------------------------------
+def analyze_image(
+    image_bytes,
     officer_id,
-    timestamp,
     latitude,
     longitude,
     accuracy_meters,
-    sha256,
-    quality,
-    reference_rect,
-    measured_reference_colors,
-    calibration,
-    test_rect,
-    test_rgb,
-    classification
 ):
-    if (
-        latitude is not None
-        and
-        longitude is not None
-    ):
-        gps = {
+    sha256 = hashlib.sha256(image_bytes).hexdigest()
+
+    arr = np.frombuffer(image_bytes, dtype=np.uint8)
+    bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+    if bgr is None:
+        raise ValueError("Uploaded file is not a readable image")
+
+    image_rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+    quality = image_quality(image_rgb)
+
+    reference_candidate, cassette_candidate, candidates = detect_reference_and_cassette(
+        image_rgb
+    )
+
+    reference = reference_candidate["rect"] if isinstance(reference_candidate, dict) else reference_candidate
+    cassette = cassette_candidate["rect"] if isinstance(cassette_candidate, dict) else cassette_candidate
+
+    timestamp = datetime.now(timezone.utc).isoformat()
+    test_id = "TEST-" + uuid.uuid4().hex[:12].upper()
+
+    if reference is None or cassette is None:
+        annotated = annotate(
+            image_rgb,
+            reference_rect=reference,
+            cassette_rect=cassette,
+            result="INCONCLUSIVE",
+            confidence=0,
+        )
+
+        return {
+            "success": True,
+            "test_id": test_id,
+            "result": "INCONCLUSIVE",
+            "confidence_percent": 0.0,
+            "officer_id": officer_id,
+            "timestamp_utc": timestamp,
+            "gps": {
+                "latitude": latitude,
+                "longitude": longitude,
+                "accuracy_meters": accuracy_meters,
+            },
+            "sha256": sha256,
+            "image_quality": quality,
+            "reference": {
+                "detected": reference is not None,
+                "rectangle_xyxy": (
+                    list(reference) if reference else None
+                ),
+            },
+            "cassette": {
+                "detected": cassette is not None,
+                "rectangle_xyxy": (
+                    list(cassette) if cassette else None
+                ),
+            },
+            "test_area": None,
+            "classification": {
+                "result": "INCONCLUSIVE",
+                "reason": (
+                    "Could not confidently detect both the reference "
+                    "swatch and test cassette."
+                ),
+            },
+            "presumptive_result": False,
+            "requires_lab_confirmation": True,
+            "scientific_limitation": (
+                "This is a prototype field-color analysis. It does not "
+                "replace laboratory confirmatory testing."
+            ),
+            "annotated_image_base64": encode_jpeg(annotated),
+        }
+
+    # Measure reference swatch.
+    reference_measurement = measure_color(
+        image_rgb,
+        reference,
+        "REFERENCE_SWATCH",
+    )
+
+    # Determine reaction area from cassette.
+    test_rect = extract_test_area(
+        image_rgb,
+        cassette,
+    )
+
+    test_measurement = measure_color(
+        image_rgb,
+        test_rect,
+        "TEST_REACTION_AREA",
+    )
+
+    reference_rgb = np.array(
+        reference_measurement["rgb"],
+        dtype=float,
+    )
+
+    test_rgb = np.array(
+        test_measurement["rgb"],
+        dtype=float,
+    )
+
+    comparison = compare_with_reference(
+        test_rgb,
+        reference_rgb,
+    )
+
+    classification = classify_demo(test_rgb)
+
+    # If the reference and reaction area are almost identical, report that
+    # explicitly. This prevents a vague "inconclusive" from hiding the
+    # actual measured color relationship.
+    if comparison["lab_distance"] < 5:
+        classification["reference_relationship"] = (
+            "TEST AREA IS VERY CLOSE TO REFERENCE COLOR"
+        )
+
+    annotated = annotate(
+        image_rgb,
+        reference_rect=reference,
+        cassette_rect=cassette,
+        test_rect=test_rect,
+        result=classification["result"],
+        confidence=classification["confidence_percent"],
+    )
+
+    return {
+        "success": True,
+        "test_id": test_id,
+        "result": classification["result"],
+        "confidence_percent": classification["confidence_percent"],
+        "officer_id": officer_id,
+        "timestamp_utc": timestamp,
+        "gps": {
             "latitude": latitude,
             "longitude": longitude,
             "accuracy_meters": accuracy_meters,
-        }
-    else:
-        gps = {
-            "latitude": None,
-            "longitude": None,
-            "accuracy_meters": None,
-            "status": "GPS unavailable",
-        }
-
-    return {
-        "test_id": test_id,
-        "result": result,
-        "confidence_percent": round(
-            float(confidence),
-            2
-        ),
-        "officer_id": officer_id,
-        "timestamp_utc": timestamp,
-        "gps": gps,
+        },
         "sha256": sha256,
-
         "image_quality": quality,
-
-        "reference_card": {
-            "detected": reference_rect is not None,
-            "rectangle_xyxy": (
-                list(reference_rect)
-                if reference_rect is not None
-                else None
-            ),
-            "expected_colors_rgb": CONFIG[
-                "reference_colors_rgb"
-            ],
-            "measured_colors_rgb": measured_reference_colors,
-            "calibration_error": calibration.get(
-                "mean_error_after"
-            ),
-        },
-
-        "calibration": {
-            "valid": bool(
-                calibration.get(
-                    "valid",
-                    False
-                )
-            ),
-            "reason": calibration.get(
-                "reason"
-            ),
-            "valid_patch_count": calibration.get(
-                "valid_patch_count",
-                0
-            ),
-            "mean_error_before_rgb": calibration.get(
-                "mean_error_before"
-            ),
-            "mean_error_after_rgb": calibration.get(
-                "mean_error_after"
-            ),
-            "patch_errors_before_rgb": calibration.get(
-                "patch_errors_before",
-                {}
-            ),
-            "patch_errors_after_rgb": calibration.get(
-                "patch_errors_after",
-                {}
-            ),
-        },
-
-        "test_area": {
-            "rectangle_xyxy": (
-                list(test_rect)
-                if test_rect is not None
-                else None
-            ),
-            "rgb": (
-                [
-                    round(
-                        float(x),
-                        2
-                    )
-                    for x in test_rgb
-                ]
-                if test_rgb is not None
-                else None
-            ),
-            "hex": (
-                rgb_to_hex(
-                    test_rgb
-                )
-                if test_rgb is not None
-                else None
-            ),
-        },
-
-        "classification": {
-            "method": (
-                "LAB_COLOUR_DISTANCE"
-            ),
-            "distances": classification.get(
-                "distances",
-                {}
-            ),
-            "reason": classification.get(
-                "reason"
-            ),
-            "best_category": classification.get(
-                "best_category"
-            ),
-            "second_category": classification.get(
-                "second_category"
-            ),
-            "best_distance": classification.get(
-                "best_distance"
-            ),
-            "second_distance": classification.get(
-                "second_distance"
-            ),
-            "absolute_margin": classification.get(
-                "absolute_margin"
-            ),
-            "relative_margin": classification.get(
-                "relative_margin"
-            ),
-            "calibration_valid": classification.get(
-                "calibration_valid",
-                calibration.get("valid", False)
-            ),
-        },
-
-        "presumptive_result": result in [
-            "POSITIVE",
-            "NEGATIVE"
-        ],
-
-        "requires_lab_confirmation": True,
-
-        "scientific_limitation": (
-            "This is a presumptive field-test result and does "
-            "not replace laboratory confirmatory testing."
-        ),
-    }
-
-
-# ============================================================================
-# COMPLETE IMAGE ANALYSIS PIPELINE
-# ============================================================================
-
-def process_image(
-    original_bytes,
-    officer_id,
-    latitude,
-    longitude,
-    accuracy_meters
-):
-    timestamp = utc_now_iso()
-
-    test_id = (
-        "TEST-" +
-        uuid.uuid4().hex[:12].upper()
-    )
-
-    # ------------------------------------------------------------------------
-    # SHA-256 MUST be calculated from original uploaded bytes.
-    # ------------------------------------------------------------------------
-    sha256 = hashlib.sha256(
-        original_bytes
-    ).hexdigest()
-
-    # ------------------------------------------------------------------------
-    # Decode original image.
-    # ------------------------------------------------------------------------
-    original_rgb = decode_original_image(
-        original_bytes
-    )
-
-    # ------------------------------------------------------------------------
-    # Create processing copy.
-    # The original bytes remain untouched for SHA-256.
-    # ------------------------------------------------------------------------
-    processed = preprocess_image(
-        original_rgb
-    )
-
-    image_rgb = processed[
-        "rgb"
-    ]
-
-    quality = calculate_image_quality(
-        image_rgb
-    )
-
-    # ------------------------------------------------------------------------
-    # Detect major rectangles.
-    # ------------------------------------------------------------------------
-    candidates = detect_rectangle_candidates(
-        image_rgb
-    )
-
-    reference_rect, reference_method = (
-        detect_reference_card(
-            image_rgb,
-            candidates
-        )
-    )
-
-    if reference_rect is None:
-
-        # Do not fabricate a reference card. Continue with the image in its
-        # original colour space so a strong binary colour match can still be
-        # evaluated. The classification layer applies conservative distance
-        # and margin gates when calibration is unavailable.
-        measured_reference_colors = {}
-        patch_rectangles = {}
-        calibration = {
-            "valid": False,
-            "reason": "Reference card could not be detected.",
-            "matrix": None,
-            "mean_error_before": None,
-            "mean_error_after": None,
-            "patch_errors_before": {},
-            "patch_errors_after": {},
-            "valid_patch_count": 0,
-        }
-
-    else:
-        # --------------------------------------------------------------------
-        # Extract six reference colours.
-        # --------------------------------------------------------------------
-        try:
-            (
-                measured_reference_colors,
-                patch_rectangles
-            ) = extract_reference_patches(
-                image_rgb,
-                reference_rect
-            )
-
-        except Exception:
-
-            measured_reference_colors = {}
-            patch_rectangles = {}
-
-        # --------------------------------------------------------------------
-        # Build affine colour calibration.
-        # --------------------------------------------------------------------
-        calibration = build_color_calibration(
-            measured_reference_colors
-        )
-
-    # ------------------------------------------------------------------------
-    # Detect cassette.
-    # ------------------------------------------------------------------------
-    cassette_rect, cassette_method = (
-        detect_test_cassette(
-            image_rgb,
-            candidates,
-            reference_rect
-        )
-    )
-
-    if cassette_rect is None:
-
-        classification = {
-            "result": "INCONCLUSIVE",
-            "confidence_percent": 10.0,
-            "distances": {},
-            "reason": (
-                "Test cassette could not be detected. "
-                "Retake Image."
-            ),
-        }
-
-        annotated = annotate_image(
-            image_rgb,
-            reference_rect,
-            None,
-            None,
-            "INCONCLUSIVE",
-            10.0
-        )
-
-        encoded_image = encode_annotated_image(
-            annotated
-        )
-
-        record = build_digital_record(
-            test_id,
-            "INCONCLUSIVE",
-            10.0,
-            officer_id,
-            timestamp,
-            latitude,
-            longitude,
-            accuracy_meters,
-            sha256,
-            quality,
-            reference_rect,
-            measured_reference_colors,
-            calibration,
-            None,
-            None,
-            classification
-        )
-
-        return {
-            "success": True,
-            "test_id": test_id,
-            "result": "INCONCLUSIVE",
-            "confidence_percent": 10.0,
-            "officer_id": officer_id,
-            "timestamp_utc": timestamp,
-            "gps": record["gps"],
-            "sha256": sha256,
-            "image_quality": quality,
-            "reference_card": {
-                "detected": True,
-                "detection_method": reference_method,
-                "calibration_error": calibration.get(
-                    "mean_error_after"
-                ),
-            },
-            "test_area": None,
-            "classification": classification,
-            "presumptive_result": False,
-            "requires_lab_confirmation": True,
-            "annotated_image_base64": encoded_image,
-            "digital_record": record,
-            "message": "Test cassette missing. Retake Image.",
-        }
-
-    # ------------------------------------------------------------------------
-    # Calibration must affect the image used for test colour extraction.
-    # ------------------------------------------------------------------------
-    calibrated_image = calibrate_entire_image(
-        image_rgb,
-        calibration
-    )
-
-    # ------------------------------------------------------------------------
-    # Extract test area.
-    # ------------------------------------------------------------------------
-    test_area, test_rect = extract_test_area(
-        calibrated_image,
-        cassette_rect
-    )
-
-    if test_area is None:
-
-        classification = {
-            "result": "INCONCLUSIVE",
-            "confidence_percent": 10.0,
-            "distances": {},
-            "reason": (
-                "Test area could not be reliably extracted. "
-                "Retake Image."
-            ),
-        }
-
-        annotated = annotate_image(
-            calibrated_image,
-            reference_rect,
-            cassette_rect,
-            None,
-            "INCONCLUSIVE",
-            10.0
-        )
-
-        encoded_image = encode_annotated_image(
-            annotated
-        )
-
-        record = build_digital_record(
-            test_id,
-            "INCONCLUSIVE",
-            10.0,
-            officer_id,
-            timestamp,
-            latitude,
-            longitude,
-            accuracy_meters,
-            sha256,
-            quality,
-            reference_rect,
-            measured_reference_colors,
-            calibration,
-            None,
-            None,
-            classification
-        )
-
-        return {
-            "success": True,
-            "test_id": test_id,
-            "result": "INCONCLUSIVE",
-            "confidence_percent": 10.0,
-            "officer_id": officer_id,
-            "timestamp_utc": timestamp,
-            "gps": record["gps"],
-            "sha256": sha256,
-            "image_quality": quality,
-            "reference_card": {
-                "detected": True,
-                "detection_method": reference_method,
-                "calibration_error": calibration.get(
-                    "mean_error_after"
-                ),
-            },
-            "test_area": None,
-            "classification": classification,
-            "presumptive_result": False,
-            "requires_lab_confirmation": True,
-            "annotated_image_base64": encoded_image,
-            "digital_record": record,
-            "message": "Test area missing. Retake Image.",
-        }
-
-    # ------------------------------------------------------------------------
-    # Robust calibrated test colour.
-    # ------------------------------------------------------------------------
-    test_rgb = extract_test_colour(
-        test_area
-    )
-
-    # ------------------------------------------------------------------------
-    # Classification.
-    # ------------------------------------------------------------------------
-    classification = classify_test_colour(
-        test_rgb,
-        quality,
-        calibration
-    )
-
-    result = classification[
-        "result"
-    ]
-
-    confidence = classification[
-        "confidence_percent"
-    ]
-
-    # ------------------------------------------------------------------------
-    # Annotation.
-    # ------------------------------------------------------------------------
-    annotated = annotate_image(
-        calibrated_image,
-        reference_rect,
-        cassette_rect,
-        test_rect,
-        result,
-        confidence
-    )
-
-    encoded_image = encode_annotated_image(
-        annotated
-    )
-
-    # ------------------------------------------------------------------------
-    # Digital record.
-    # ------------------------------------------------------------------------
-    record = build_digital_record(
-        test_id,
-        result,
-        confidence,
-        officer_id,
-        timestamp,
-        latitude,
-        longitude,
-        accuracy_meters,
-        sha256,
-        quality,
-        reference_rect,
-        measured_reference_colors,
-        calibration,
-        test_rect,
-        test_rgb,
-        classification
-    )
-
-    response = {
-        "success": True,
-
-        "test_id": test_id,
-
-        "result": result,
-
-        "confidence_percent": round(
-            float(confidence),
-            2
-        ),
-
-        "officer_id": officer_id,
-
-        "timestamp_utc": timestamp,
-
-        "gps": record["gps"],
-
-        "sha256": sha256,
-
-        "image_quality": quality,
-
-        "reference_card": {
-            "detected": reference_rect is not None,
-            "detection_method": reference_method,
-            "rectangle_xyxy": (
-                list(reference_rect)
-                if reference_rect is not None
-                else None
-            ),
-            "measured_colors_rgb": measured_reference_colors,
-            "calibration_error": calibration.get(
-                "mean_error_after"
-            ),
-            "calibration_valid": calibration.get(
-                "valid",
-                False
-            ),
-            "calibration_reason": calibration.get(
-                "reason"
-            ),
-        },
-
-        "test_cassette": {
+        "reference": {
             "detected": True,
-            "detection_method": cassette_method,
-            "rectangle_xyxy": list(
-                cassette_rect
-            ),
+            "rectangle_xyxy": list(reference),
+            "color": reference_measurement,
         },
-
+        "cassette": {
+            "detected": True,
+            "rectangle_xyxy": list(cassette),
+        },
         "test_area": {
-            "rectangle_xyxy": (
-                list(test_rect)
-                if test_rect is not None
-                else None
-            ),
-            "rgb": (
-                [
-                    round(
-                        float(x),
-                        2
-                    )
-                    for x in test_rgb
-                ]
-                if test_rgb is not None
-                else None
-            ),
-            "hex": (
-                rgb_to_hex(
-                    test_rgb
-                )
-                if test_rgb is not None
-                else None
-            ),
+            "rectangle_xyxy": list(test_rect),
+            "color": test_measurement,
         },
-
-        "classification": {
-            "method": "LAB_COLOUR_DISTANCE",
-            "distances": classification.get(
-                "distances",
-                {}
-            ),
-            "reason": classification.get(
-                "reason"
-            ),
-            "best_category": classification.get(
-                "best_category"
-            ),
-            "second_category": classification.get(
-                "second_category"
-            ),
-            "best_distance": classification.get(
-                "best_distance"
-            ),
-            "second_distance": classification.get(
-                "second_distance"
-            ),
-            "absolute_margin": classification.get(
-                "absolute_margin"
-            ),
-            "relative_margin": classification.get(
-                "relative_margin"
-            ),
-            "calibration_valid": classification.get(
-                "calibration_valid",
-                calibration.get("valid", False)
-            ),
-        },
-
-        "presumptive_result": result in [
+        "comparison": comparison,
+        "classification": classification,
+        "presumptive_result": classification["result"] in {
             "POSITIVE",
-            "NEGATIVE"
-        ],
-
+            "NEGATIVE",
+        },
         "requires_lab_confirmation": True,
-
         "scientific_limitation": (
-            "This is a presumptive field-test result and does "
-            "not replace laboratory confirmatory testing."
+            "This is a prototype presumptive field-test result and "
+            "does not replace laboratory confirmatory testing. "
+            "Positive/negative prototypes must be calibrated using "
+            "known samples from the exact test kit."
         ),
-
-        "annotated_image_base64": encoded_image,
-
-        "digital_record": record,
+        "detected_rectangle_count": len(candidates),
+        "annotated_image_base64": encode_jpeg(annotated),
     }
 
-    if result == "INCONCLUSIVE":
-        response["message"] = (
-            "INCONCLUSIVE. Retake Image."
-        )
 
-    else:
-        response["message"] = (
-            "Analysis completed. "
-            "This remains a presumptive field-test result."
-        )
-
-    return response
-
-
-# ============================================================================
-# REQUEST VALIDATION
-# ============================================================================
-
-def validate_coordinates(
-    latitude,
-    longitude
-):
-    if latitude is None:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "success": False,
-                "error": "Missing latitude",
-                "message": (
-                    "Latitude is required."
-                ),
-            }
-        )
-
-    if longitude is None:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "success": False,
-                "error": "Missing longitude",
-                "message": (
-                    "Longitude is required."
-                ),
-            }
-        )
-
-    if not (
-        -90.0 <= latitude <= 90.0
-    ):
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "success": False,
-                "error": "Invalid latitude",
-                "message": (
-                    "Latitude must be between -90 and 90."
-                ),
-            }
-        )
-
-    if not (
-        -180.0 <= longitude <= 180.0
-    ):
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "success": False,
-                "error": "Invalid longitude",
-                "message": (
-                    "Longitude must be between -180 and 180."
-                ),
-            }
-        )
-
-
-# ============================================================================
-# HEALTH ENDPOINT
-# ============================================================================
-
-@app.get(
-    "/health"
-)
-async def health():
+# ---------------------------------------------------------------------------
+# API
+# ---------------------------------------------------------------------------
+@app.get("/")
+def root():
     return {
-        "status": "ok"
+        "service": "Field Drug Testing Color Analysis API",
+        "version": "3.0",
+        "status": "online",
+        "endpoint": "POST /analyze",
     }
 
 
-# ============================================================================
-# ANALYZE ENDPOINT
-# ============================================================================
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "version": "3.0",
+        "demo_mode": DEMO_MODE,
+    }
 
-@app.post(
-    "/analyze"
-)
+
+@app.post("/analyze")
 async def analyze(
     officer_id: str = Form(...),
     latitude: float = Form(...),
     longitude: float = Form(...),
-    accuracy_meters: Optional[float] = Form(None),
-    image: UploadFile = File(...)
+    accuracy_meters: float = Form(...),
+    image: UploadFile = File(...),
 ):
-    try:
+    image_bytes = await image.read()
 
-        # ------------------------------------------------------------
-        # Officer ID validation.
-        # ------------------------------------------------------------
-        if officer_id is None:
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "success": False,
-                    "error": "Missing officer_id",
-                    "message": (
-                        "officer_id is required."
-                    ),
-                }
-            )
-
-        officer_id = officer_id.strip()
-
-        if not officer_id:
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "success": False,
-                    "error": "Missing officer_id",
-                    "message": (
-                        "officer_id cannot be empty."
-                    ),
-                }
-            )
-
-        # ------------------------------------------------------------
-        # GPS validation.
-        # ------------------------------------------------------------
-        latitude_value = safe_float(
-            latitude
-        )
-
-        longitude_value = safe_float(
-            longitude
-        )
-
-        accuracy_value = safe_float(
-            accuracy_meters
-        )
-
-        validate_coordinates(
-            latitude_value,
-            longitude_value
-        )
-
-        # ------------------------------------------------------------
-        # Image validation.
-        # ------------------------------------------------------------
-        if image is None:
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "success": False,
-                    "error": "Missing image",
-                    "message": (
-                        "An image file is required."
-                    ),
-                }
-            )
-
-        original_bytes = await image.read()
-
-        if not original_bytes:
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "success": False,
-                    "error": "Invalid image",
-                    "message": (
-                        "The uploaded image is empty."
-                    ),
-                }
-            )
-
-        # ------------------------------------------------------------
-        # Process.
-        # ------------------------------------------------------------
-        result = process_image(
-            original_bytes,
-            officer_id,
-            latitude_value,
-            longitude_value,
-            accuracy_value
-        )
-
-        return JSONResponse(
-            status_code=200,
-            content=result
-        )
-
-    except HTTPException:
-        raise
-
-    except ValueError as exc:
-
-        return JSONResponse(
+    if not image_bytes:
+        raise HTTPException(
             status_code=400,
-            content={
-                "success": False,
-                "error": "Invalid image",
-                "message": str(exc),
-            }
+            detail="Empty image upload",
         )
 
-    except cv2.error:
-
-        return JSONResponse(
-            status_code=422,
-            content={
-                "success": False,
-                "error": "OpenCV processing failure",
-                "message": (
-                    "The uploaded image could not be processed "
-                    "by the computer-vision pipeline."
-                ),
-            }
+    if len(image_bytes) > 15 * 1024 * 1024:
+        raise HTTPException(
+            status_code=413,
+            detail="Image is larger than 15 MB",
         )
 
-    except Exception:
+    try:
+        result = analyze_image(
+            image_bytes=image_bytes,
+            officer_id=officer_id,
+            latitude=latitude,
+            longitude=longitude,
+            accuracy_meters=accuracy_meters,
+        )
 
-        # Do not expose traceback/internal implementation details.
+        return JSONResponse(content=result)
+
+    except Exception as exc:
         return JSONResponse(
             status_code=500,
             content={
                 "success": False,
-                "error": "Processing failed",
-                "message": (
-                    "The image could not be processed. "
-                    "Please retake the image and try again."
-                ),
-            }
+                "error": str(exc),
+            },
         )
 
-
-# ============================================================================
-# OPTIONAL ROOT ENDPOINT
-# ============================================================================
-
-@app.get("/")
-async def root():
-    return {
-        "service": "Digital Companion for Field Drug Testing",
-        "status": "running",
-        "health": "/health",
-        "analyze": "POST /analyze",
-        "docs": "/docs",
-    }
-
-
-# ============================================================================
-# DIRECT EXECUTION
-# ============================================================================
 
 if __name__ == "__main__":
     import uvicorn
 
+    port = int(os.getenv("PORT", "8000"))
+
     uvicorn.run(
-        app,
+        "main:app",
         host="0.0.0.0",
-        port=8000
+        port=port,
+        reload=False,
     )
