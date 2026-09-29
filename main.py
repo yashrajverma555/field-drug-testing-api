@@ -14,8 +14,7 @@ test2 = np.array([226., 138., 135.])
 chroma2 = np.hypot(ref2[1] - test2[1], ref2[2] - test2[2])
 lab_dist2 = np.linalg.norm(ref2 - test2)
 print('Green vs Pink -> Chroma dist:', chroma2, 'LAB dist:', lab_dist2)
-"`
-Ran command: `cat << 'EOF' > /tmp/test_main_strict.py
+
 import base64
 import datetime
 import hashlib
@@ -649,12 +648,7 @@ async def analyze_test(
                 "error": f"An error occurred while processing the test image: {str(e)}"
             }
         )
-EOF
-python3 -m py_compile /tmp/test_main_strict.py
-`
-Ran command: `rm /tmp/test_main_strict.py`
 
-```python
 import base64
 import datetime
 import hashlib
