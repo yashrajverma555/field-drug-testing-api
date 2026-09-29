@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 # ------------------------------------------------------------------------------
-# Logging & Server Configuration
+# Logging & Server Configuratio
 # ------------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
